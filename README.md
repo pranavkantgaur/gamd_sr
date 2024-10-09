@@ -1,4 +1,4 @@
-# gnn_md_sr
+# gamd_sr
 GNN over MD simulation data -> Symbolic regression over edge embeddings -> Force equation recovered?
 
 # TODOs
