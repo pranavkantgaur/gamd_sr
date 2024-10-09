@@ -75,9 +75,28 @@
             1. How to express and track mae in percentage? https://www.perplexity.ai/search/how-to-express-mean-absolute-e-PHS6mVllTOWDSkriPaI6Sg#0
             2. Add validation loss , model checkpoint 
             3. Dump edge embeddings of best performing model for subsequent SR
-            4. Add SR code for force equation prediction
-            5. Run the resulting GNN -> SR pipeline and plan workitems for the next iteration based on results.
-            6. Tentative workitems for the next iteration:
+            4. Write Sgmm based message passing using triton or other kernel library
+            5. Add SR code for force equation prediction
+            6. Run the resulting GNN -> SR pipeline and plan workitems for the next iteration based on results.
+            7. Backlog (can be used to plan next iteration):
                1. Whether the model overfits on a single file?
                2. At what loss value to say that it has overfitted?
                3. Why the current model is not able to go below 0.1 on training data?
+               4. Update PhD in nos note
+               5. How does the official GAMD model perform on this data without any simplifications?
+               6. GAMD official trains in mixed precision, why?
+               7. Make notes on the concept of [transformers as GNNs](https://docs.dgl.ai/en/2.2.x/tutorials/models/4_old_wines/7_transformer.html#sphx-glr-tutorials-models-4-old-wines-7-transformer-py).
+               8. Create a notebook for LJ data exploration and the following:
+               9. E2E training eval skeleton:
+                  11. 1. Create dataloader
+                      2. Create a model class which can then latter be experimented with
+                      3. Create validation data loader
+                      4. Write [model.fit](http://model.fit) where the model class could be experimented with starting from a baseline model
+              10. Get and document dumb baselines in a notebook:
+                  1.Lower bound: dumbest model for prediction on validation data
+                  2. Upper bound: Human performance on validation data
+              11. Overfit on single MD file
+              12. Test overfitting on any random MD file
+              13. Regularize the model to improve it for the validation dataset
+              14. Tune by hyperparam search
+              15. Further improve by ensembling and longer training runs
