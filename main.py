@@ -57,55 +57,34 @@ torch.backends.cudnn.benchmark = False
 random.seed(seed)
 
 class MDDataset(Dataset):
-  def __init__(self, data_dir, rotation_aug=False, avg_num_neighbors = 20, train_data_fraction = 0.9):
+  def __init__(self, data_dir, rotation_aug=False, avg_num_neighbors = 20, train_data_fraction = 0.9, return_train_data = False, val_idx = None):
     self.data_dir = data_dir
 
     # randomly sample 90% files from the dir
     original_data_files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
-
-    number_of_train_files = int(len(original_data_files) * train_data_fraction)
-    self.data_files = random.sample(original_data_files, number_of_train_files)
-    
+   
     idxs = np.arange(len(original_data_files))
     np.random.seed(0)   # fix same random seed
     np.random.shuffle(idxs)
     ratio = train_data_fraction
-    self.idx = idxs[:int(len(idxs)*ratio)]
-
-    
-    # save train and test filenames
-    train_data_filenames_file = open("train_data_filemames.txt", 'w')
-    for filename in self.data_files:
-       train_data_filenames_file.write(filename)
-    
-    test_data_filenames_file = open("test_data_filemames.txt", 'w')
-    test_data_filenames = set(original_data_files) - set(self.data_files)
-    for filename in test_data_filenames:
-       test_data_filenames_file.write(filename)
-
+    if return_train_data:
+      self.idx = idxs[:int(len(idxs)*ratio)]
+      self.val_idx = idxs[int(len(idxs)*ratio):]
+    else:
+      if len(val_idx):
+        self.idx = val_idx
+      else:
+        print("Please provide validation file indices as input")
+        exit(0)
     self.rotation_aug = rotation_aug
     self.avg_num_neighbors = avg_num_neighbors
     
     self.force_scaler = StandardScaler()
-
-
-    # Initialize empty variables to store normalization statistics (mean and std)
-    self.pos_mean = None
-    self.pos_std = None
-    self.vel_mean = None
-    self.vel_std = None
-    self.force_mean = None
-    self.force_std = None
-    self.num_particles = None
-    print("Calculating stats...")
-    #self.simulation_box = self._get_simulation_box(self.num_particles)
-    #print("Simulation box size based on simulation parameters is: ", self.simulation_box)
-    self.calculate_stats_and_simulation_box()  # Call a new function to calculate statistics
-    print("Calculated stats.")    
-    print("Simulation box size based on MD simulation data is: ", self.simulation_box)
+    self.num_particles = 258  
     self.cutoff_distance = 7.5 # as per https://github.com/BaratiLab/GAMD/blob/main/code/LJ/train_network_lj.py#L26
     BOX_SIZE = 27.27
     self.simulation_box = jnp.array([BOX_SIZE, BOX_SIZE, BOX_SIZE])
+    print("Simulation box size based on MD simulation data is: ", self.simulation_box)
     self.displacement_function, _ = jax_md.space.periodic(self.simulation_box)
     self.neighbor_list_fn = jax_md.partition.neighbor_list(displacement_or_metric = self.displacement_function, \
     box = self.simulation_box, r_cutoff = self.cutoff_distance, dr_threshold= self.cutoff_distance / 6.,
@@ -113,51 +92,12 @@ class MDDataset(Dataset):
     self.neighbor_list_fn_jit = jax.jit(self.neighbor_list_fn) # to be used for neighborlist updates.                                                           
     self.neighborlist_has_been_init = False
     self.last_neighbor_list_obj = None                                                       
-
-  def _read_data_file(self, data_file):
-    data = np.load(os.path.join(self.data_dir, data_file))
-    return data['pos'], data['vel'], data['forces']
-
-  def calculate_stats_and_simulation_box(self):
-    # Iterate through all data files to calculate statistics across the entire dataset
-    pos_list, vel_list, force_list = [], [], []
-    print(f"Total {len(self.data_files)} frames will be used for training.")
-    for data_file in self.data_files:
-      data = np.load(os.path.join(self.data_dir, data_file))
-      pos_list.append(data['pos'])
-      vel_list.append(data['vel'])
-      force_list.append(data['forces'])
-    # Concatenate data from all files
-    pos_all = np.concatenate(pos_list, axis=0)
-    vel_all = np.concatenate(vel_list, axis=0)
-    force_all = np.concatenate(force_list, axis=0)
     
-    # also calculate the simulation box size across all MD frames
-    pos_min = np.min(pos_all, axis=0)
-    pos_max = np.max(pos_all, axis = 0)
-    max_distance = np.sqrt(pos_max - pos_min) ** 2
-    print("Distance: ", max_distance)
-    margin = 0.1 # angstrom    
-    sim_box_edge_lengths_angs = max_distance + margin
-    print("sim_box_edge_lengths_angs: ", sim_box_edge_lengths_angs)
-    self.simulation_box = jnp.array(sim_box_edge_lengths_angs)
-
-    # Calculate mean and standard deviation
-    self.pos_mean = pos_all.mean(axis=0)
-    self.pos_std = pos_all.std(axis=0)
-    self.vel_mean = vel_all.mean(axis=0)
-    self.vel_std = vel_all.std(axis=0)
-    self.force_mean = force_all.mean(axis=0)
-    self.force_std = force_all.std(axis=0)
-
-    self.num_particles = pos_list[0].shape[0]
-    
-    print(f"Detected {self.num_particles} particles.")
-
+  def get_val_data_idx(self):
+    return self.val_idx # for validation 
 
   def __len__(self):    
-    return len(self.data_files)
-
+    return len(self.idx)
   
   def masking_fn(self, pos: jnp.ndarray, neigh_idx: jnp.ndarray):
     # notice here, pos must be jax numpy array, otherwise fancy indexing will fail
@@ -214,17 +154,6 @@ class MDDataset(Dataset):
       if self.last_neighbor_list_obj.did_buffer_overflow:
         self.last_neighbor_list_obj = self.neighbor_list_fn.allocate(pos)      
     neighbor_indices = self.last_neighbor_list_obj.idx
-    '''
-    valid_edges = []    
-    edge_index_list_start_time = time.time()
-    for i in range(neighbor_indices.shape[0]):
-      for j in range(neighbor_indices.shape[1]):
-        if neighbor_indices[i, j] < self.num_particles and neighbor_indices[i, j] != i:
-          valid_edges.append([i, neighbor_indices[i, j]])
-    edge_index_list_end_time = time.time()           
-    print(f"INFO: edge index creation loop took: {edge_index_list_end_time - edge_index_list_start_time}")
-    edge_index = torch.tensor(valid_edges, dtype=torch.long, device=device)
-    '''    
     edge_mask_all = self.masking_fn(pos, neighbor_indices)
     edge_index = self.get_edge_idx(self.last_neighbor_list_obj, pos, edge_mask_all).long()
 
@@ -237,10 +166,6 @@ class MDDataset(Dataset):
 
   def __getitem__(self, idx):
     get_item_start_time = time.time()
-    if self.pos_mean is None or self.pos_std is None or self.vel_mean is None or self.vel_std is None:
-      raise RuntimeError("Normalization statistics not calculated. Call calculate_stats() first.")
-
-    #data_file = self.data_files[idx]
     idx = self.idx[idx]
     sample_num = 1000
     sample_to_read = idx % sample_num
@@ -526,13 +451,13 @@ def custom_collate(batch):
   edge_index_list_batch = []
   force_batch = []
   for sample_id, (pos, edge_index_list, force) in enumerate(batch):
-    pos_batch.append(pos)
+    pos_batch.append(pos)    
     # increment the edge indices to point to correct atom ids in the batched graph    
-    edge_index_list_batch.append(edge_index_list + sample_id * pos.shape[0])     
+    edge_index_list_batch.append(edge_index_list + sample_id * pos.shape[0])         
     force_batch.append(force)  
-  pos_batch = torch.cat(pos_batch, dim=0)
-  edge_index_list_batch = torch.cat(edge_index_list_batch, dim=0)
-  force_batch = torch.cat(force_batch, dim=0)  
+  pos_batch = torch.cat(pos_batch, dim=0).to(device)
+  edge_index_list_batch = torch.cat(edge_index_list_batch, dim=1).to(device)
+  force_batch = torch.cat(force_batch, dim=0).to(device)  
   
   return pos_batch, edge_index_list_batch, force_batch
 
@@ -549,8 +474,8 @@ def print_model_summary(gamdnet, summary_writer):
   summary_writer.add_graph(gamdnet, (node_features, edge_indices))
 
 # Calculate MAPE
-def evaluate_on_train_data(y_true, y_pred):
-  
+def evaluate(y_true, y_pred):
+    
   # Avg. cosine similarity
   # Step 1: Compute the dot product
   dot_product = torch.sum(y_true * y_pred, dim=1)
@@ -577,11 +502,13 @@ def evaluate_on_train_data(y_true, y_pred):
   # Step 3: Take the square root of the mean squared difference for each dimension
   rmse = torch.sqrt(mean_squared_diff).mean()
 
-  print("RMSE:", rmse.item())    
+  print("RMSE is:", rmse.item())    
 
   ## Relative error
   # Step 1: Calculate Mean Absolute Error (MAE)
   mae = torch.mean(torch.abs(y_pred - y_true))
+
+  print("MAE is: ", mae.item())
   
   # Step 2: Calculate Mean L2 Norm of the ground truth
   mean_l2_norm = torch.mean(torch.norm(y_true, dim=1))  # mean across n samples
@@ -594,8 +521,8 @@ def evaluate_on_train_data(y_true, y_pred):
   
   print("Relative error is: ", relative_error.item())
   
-
-
+def load_val_dataset(val_dataset_filename):
+  return val_pos, val_force
 
 if __name__ == '__main__':
   # read GAMD 
@@ -604,8 +531,17 @@ if __name__ == '__main__':
   avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
   rotation_aug = False # online rotation augmentation for a frame
   batch_size = 1 # number of graphs in a batch
-  dataset = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction) 
+  # create train data-loader
+  return_train_data = True  
+  dataset = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
   dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
+  
+  # create val data loader
+  return_train_data = False
+  rotation_aug = False
+  val_idx = dataset.get_val_data_idx()
+  dataset_val = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data, val_idx) 
+  dataloader_val = DataLoader(dataset_val, batch_size=5, shuffle=False, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
   
   # train MPNN and input and output MLPs
   num_epochs = 30 # for batch size 1, 300k gradient updates are required. (as per paper)
@@ -654,7 +590,15 @@ if __name__ == '__main__':
       optimizer.zero_grad()
       force_loss.backward()
       with torch.no_grad():  # Disable gradient calculation
-        evaluate_on_train_data(force, node_forces)
+        #print("TRAIN PERFORMANCE: ")
+        #evaluate(force, node_forces)
+        if (iteration + 1) % 10 == 0: 
+          # validate
+          print("Reading val data...")
+          pos_val, edge_index_list_val, force_val = next(iter(dataloader_val))
+          node_forces_val = gamdnet.forward(pos_val, edge_index_list_val)                            
+          print("VAL PEFORMANCE: ")
+          evaluate(force_val, node_forces_val)
         
       '''
       # Print gradients for each parameter in the model
