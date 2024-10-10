@@ -520,6 +520,8 @@ def evaluate(y_true, y_pred):
   relative_error = mae / mean_l2_norm
   
   print("Relative error is: ", relative_error.item())
+
+  return mae.item()
   
 def load_val_dataset(val_dataset_filename):
   return val_pos, val_force
@@ -541,7 +543,7 @@ if __name__ == '__main__':
   rotation_aug = False
   val_idx = dataset.get_val_data_idx()
   dataset_val = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data, val_idx) 
-  dataloader_val = DataLoader(dataset_val, batch_size=5, shuffle=False, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
+  dataloader_val = DataLoader(dataset_val, batch_size=10, shuffle=False, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
   
   # train MPNN and input and output MLPs
   num_epochs = 30 # for batch size 1, 300k gradient updates are required. (as per paper)
@@ -573,7 +575,8 @@ if __name__ == '__main__':
   writer = SummaryWriter()
   #print_model_summary(gamdnet, writer)
   #exit(0)
-
+  best_mae = float('inf')
+  save_path = 'best_model.pt'
   for epoch in range(num_epochs): 
     total_loss = 0.0           
     iteration = 0
@@ -592,14 +595,23 @@ if __name__ == '__main__':
       with torch.no_grad():  # Disable gradient calculation
         #print("TRAIN PERFORMANCE: ")
         #evaluate(force, node_forces)
-        if (iteration + 1) % 10 == 0: 
+        if (iteration + 1) % 100 == 0: 
           # validate
           print("Reading val data...")
           pos_val, edge_index_list_val, force_val = next(iter(dataloader_val))
           node_forces_val = gamdnet.forward(pos_val, edge_index_list_val)                            
           print("VAL PEFORMANCE: ")
-          evaluate(force_val, node_forces_val)
-        
+          mae = evaluate(force_val, node_forces_val)
+          if mae < best_mae:
+            best_mae = mae           
+            # Save the new best model checkpoint
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': gamdnet.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'mae': best_mae,
+            }, save_path)
+            print(f'Saved new best model with MAE: {best_mae:.4f}')                              
       '''
       # Print gradients for each parameter in the model
       for name, param in gamdnet.named_parameters():
