@@ -548,6 +548,54 @@ def print_model_summary(gamdnet, summary_writer):
 
   summary_writer.add_graph(gamdnet, (node_features, edge_indices))
 
+# Calculate MAPE
+def evaluate_on_train_data(y_true, y_pred):
+  
+  # Avg. cosine similarity
+  # Step 1: Compute the dot product
+  dot_product = torch.sum(y_true * y_pred, dim=1)
+
+  # Step 2: Compute the magnitudes
+  magnitude_F = torch.norm(y_true, dim=1)
+  magnitude_F_prime = torch.norm(y_pred, dim=1)
+
+  # Step 3: Compute cosine similarity
+  cosine_similarity = dot_product / (magnitude_F * magnitude_F_prime)
+
+  # Step 4: Compute the average value of cosine similarity
+  average_cosine_similarity = torch.mean(cosine_similarity)
+
+  print("Average Cosine Similarity:", average_cosine_similarity.item())
+
+  # RMSE  
+  # Step 1: Calculate the squared differences
+  squared_diff = (y_pred - y_true) ** 2
+    
+  # Step 2: Calculate the mean of squared differences along the first dimension (across n)
+  mean_squared_diff = torch.mean(squared_diff, dim=0)
+    
+  # Step 3: Take the square root of the mean squared difference for each dimension
+  rmse = torch.sqrt(mean_squared_diff).mean()
+
+  print("RMSE:", rmse.item())    
+
+  ## Relative error
+  # Step 1: Calculate Mean Absolute Error (MAE)
+  mae = torch.mean(torch.abs(y_pred - y_true))
+  
+  # Step 2: Calculate Mean L2 Norm of the ground truth
+  mean_l2_norm = torch.mean(torch.norm(y_true, dim=1))  # mean across n samples
+  
+  # Step 3: Calculate relative error
+  if mean_l2_norm == 0:
+      raise ValueError("Mean L2 norm of targets is zero; cannot compute relative error.")
+  
+  relative_error = mae / mean_l2_norm
+  
+  print("Relative error is: ", relative_error.item())
+  
+
+
 
 if __name__ == '__main__':
   # read GAMD 
@@ -605,7 +653,9 @@ if __name__ == '__main__':
       force_loss = criterion(node_forces, force) # [b * num_nodes, 3], [b * num_nodes, 3] -> [1]
       optimizer.zero_grad()
       force_loss.backward()
-
+      with torch.no_grad():  # Disable gradient calculation
+        evaluate_on_train_data(force, node_forces)
+        
       '''
       # Print gradients for each parameter in the model
       for name, param in gamdnet.named_parameters():
