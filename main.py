@@ -36,6 +36,8 @@ import cupy
 from sklearn.preprocessing import StandardScaler  
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
+import triton
+import triton.language as tl
 
 # check for CUDA device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,7 +229,31 @@ class MDDataset(Dataset):
     rotation_matrix = torch.eye(3) + torch.sin(random_angle) * K + (1 - torch.cos(random_angle)) * torch.matmul(K, K) # [3,3] shaped tensor
     return rotation_matrix # [3, 3] shaped tensor
 
+@triton.jit
+def _propogate_messages(src_node_embeddings_ptr, edge_embeddings_ptr,
+    dest_node_messages_ptr,
+    adjacency_list_ptr, 
+    num_edges,
+    BLOCK_SIZE: tl.constexpr      
+  ):
+  # Get the unique thread ID
+  tid = tl.program_id(0)
 
+  if tid < num_edges:
+      # Load destination node index from adjacency list (0th row)
+      dest_node_idx = tl.load(adjacency_list_ptr + tid)  # Use load instead of direct indexing
+
+      # Load edge embedding
+      edge_embedding = tl.load(edge_embeddings_ptr + tid)  
+      
+      # Load source node embedding for this edge
+      src_embedding = tl.load(src_node_embeddings_ptr + tid) #+ src_node_idx)  # Use src_node_idx for correct loading
+      
+      # Compute the message as the product of source node embedding and edge embedding
+      message = src_embedding * edge_embedding
+      
+      # Aggregate the message into destination node messages using atomic addition
+      tl.atomic_add(dest_node_messages_ptr + dest_node_idx, message)
 
 class MPBlock(nn.Module):
     def __init__(self, embed_dim, hidden_dim):
@@ -273,6 +299,7 @@ class MPBlock(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)  # Apply Xavier initialization
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)  # Initialize biases to zero
+    
 
 
     def forward(self, node_embeddings, edge_embeddings, edge_index_list): 
@@ -283,8 +310,18 @@ class MPBlock(nn.Module):
         center_node_embeddings = node_embeddings[center_node_index]
         neighbor_node_embeddings = node_embeddings[neighbor_node_index]
         sum_tensor = edge_embeddings + center_node_embeddings + neighbor_node_embeddings
-        theta_edge = self.phi(sum_tensor)
-
+        theta_edge = self.phi(sum_tensor)        
+        
+        
+        # Launching the kernel
+        block_size = 256  # Define block size based on your GPU architecture
+        num_edges = theta_edge.shape[0]
+        grid_size = (num_edges + block_size - 1) // block_size        
+        aggregated_edge_messages = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
+        _propogate_messages[(grid_size,)](neighbor_node_embeddings, theta_edge, 
+        aggregated_edge_messages, edge_index_list, num_edges, BLOCK_SIZE=block_size) # calls the message passing kernel
+        
+        '''
         edge_message_neigh_center = (neighbor_node_embeddings * theta_edge)#.to(torch.float16)  # Convert to float16        
 
         # Collect edge messages received by each node
@@ -305,6 +342,7 @@ class MPBlock(nn.Module):
             [torch.sum(torch.stack(row), dim=0).unsqueeze(0) for row in node_edge_messages],
             dim=0
         )#.to(torch.float16)  # Ensure the result is float16
+        '''
         #print(f"INFO: theta edge before PHI: {theta_edge[150]}")
         #print(f"INFO: edge embeddings before PHI: {edge_embeddings[150]}")
         #print(f"INFO before PHI: node embeddings: {node_embeddings[150]}, aggregated edge mesage: {aggregated_edge_messages[150]}")
