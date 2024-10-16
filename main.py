@@ -17,7 +17,8 @@ default_n_threads = 8 # per https://stackoverflow.com/a/77609017/985166
 os.environ['OPENBLAS_NUM_THREADS'] = f"{default_n_threads}"
 os.environ['MKL_NUM_THREADS'] = f"{default_n_threads}"
 os.environ['OMP_NUM_THREADS'] = f"{default_n_threads}"
-os.environ["CUDA_VISIBLE_DEVICES"] = '1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+
 import math
 import time
 import numpy as np
@@ -234,12 +235,15 @@ def _propogate_messages(src_node_embeddings_ptr, edge_embeddings_ptr,
     dest_node_messages_ptr,
     adjacency_list_ptr, 
     num_edges,
+    invocation_counter_ptr,  # Pointer to atomic counter
     BLOCK_SIZE: tl.constexpr      
   ):
   # Get the unique thread ID
   tid = tl.program_id(0)
-
+  #print("TID is: ", tid)
+  #print("Num edges are: ", num_edges)
   if tid < num_edges:
+      #print("YESYSYSYSYSY")
       # Load destination node index from adjacency list (0th row)
       dest_node_idx = tl.load(adjacency_list_ptr + tid)  # Use load instead of direct indexing
 
@@ -254,6 +258,9 @@ def _propogate_messages(src_node_embeddings_ptr, edge_embeddings_ptr,
       
       # Aggregate the message into destination node messages using atomic addition
       tl.atomic_add(dest_node_messages_ptr + dest_node_idx, message)
+      
+      # Increment the atomic counter
+      tl.atomic_add(invocation_counter_ptr, 1)      
 
 class MPBlock(nn.Module):
     def __init__(self, embed_dim, hidden_dim):
@@ -304,6 +311,7 @@ class MPBlock(nn.Module):
 
     def forward(self, node_embeddings, edge_embeddings, edge_index_list): 
         # [b * num_nodes, embed_dim], [e, embed_dim], [e, embed_dim], [e, 2]         
+        #mpblock_start_time = time.time()
         node_embeddings = self.layer_norm(node_embeddings) # [b * num_nodes, embed_dim]     
         center_node_index = edge_index_list[0, :] # [1, e] 
         neighbor_node_index = edge_index_list[1, :] # [1, e]
@@ -314,14 +322,24 @@ class MPBlock(nn.Module):
         
         
         # Launching the kernel
-        block_size = 256  # Define block size based on your GPU architecture
-        num_edges = theta_edge.shape[0]
+        block_size = 1#256  # Define block size based on your GPU architecture
+        num_edges = theta_edge.shape[0]        
         grid_size = (num_edges + block_size - 1) // block_size        
+        #print("Grid size: ", grid_size)
         aggregated_edge_messages = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
-        _propogate_messages[(grid_size,)](neighbor_node_embeddings, theta_edge, 
-        aggregated_edge_messages, edge_index_list, num_edges, BLOCK_SIZE=block_size) # calls the message passing kernel
-        
+        # Host code to check counter
+        invocation_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
+        _propogate_messages[(grid_size,)](      
+            neighbor_node_embeddings, theta_edge, 
+            aggregated_edge_messages, edge_index_list, num_edges, invocation_counter,  # Pass the pointer to the counter            
+            BLOCK_SIZE=block_size)
         '''
+        # Check if all threads were invoked
+        if invocation_counter.item() == num_edges:
+            print("All thread IDs were invoked.")
+        else:
+            print(f"Only {invocation_counter.item()} out of {num_edges} thread IDs were invoked.")        
+        
         edge_message_neigh_center = (neighbor_node_embeddings * theta_edge)#.to(torch.float16)  # Convert to float16        
 
         # Collect edge messages received by each node
@@ -348,6 +366,8 @@ class MPBlock(nn.Module):
         #print(f"INFO before PHI: node embeddings: {node_embeddings[150]}, aggregated edge mesage: {aggregated_edge_messages[150]}")
         #print("Edge index list before PHI: ", edge_index_list.shape, edge_index_list[0, 350], edge_index_list[1, 350])
         node_embeddings = self.theta(node_embeddings + aggregated_edge_messages)  
+        #mpblock_end_time = time.time()
+        #print("MPBLOCK time: ", mpblock_end_time - mpblock_start_time)
         return node_embeddings
 
 
@@ -448,8 +468,11 @@ class GAMDNet(nn.Module):
         num_nodes = pos.shape[0]                
         node_embeddings = self.node_embeddings.repeat((num_nodes, 1)).to(device)
         #print(f"INFO: node_embeddings: {node_embeddings[100]}, edge embeddings: {edge_embeddings[100]}, edge list: {edge_index_list[:, 100]}")
-        
+        mpnn_start_time = time.time()
         node_embeddings = self.mpnn_mlps(node_embeddings, edge_embeddings, edge_index_list) # L blocks of weights (L sequential MLPs),         
+        mpnn_end_time = time.time()
+        print("MPNN time: ", mpnn_end_time - mpnn_start_time)
+        #exit(0)
         node_forces = self.force_pred_mlp(node_embeddings) # weights, mlp, [b * num_nodes, embed_dim] -> [b * num_nodes, 3]
         
         return node_forces
@@ -574,7 +597,7 @@ if __name__ == '__main__':
   # create train data-loader
   return_train_data = True  
   dataset = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
-  dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
+  dataloader = DataLoader(dataset, num_workers = 0, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)#, num_workers = os.cpu_count()) # create a batched graph and return
   
   # create val data loader
   return_train_data = False
@@ -613,8 +636,38 @@ if __name__ == '__main__':
   writer = SummaryWriter()
   #print_model_summary(gamdnet, writer)
   #exit(0)
+
+  ############################################################################################
+  # Launching the kernel
+        
+  #print("Grid size: ", grid_size)  
+  # Example parameters
+  num_edges = 5  # Number of edges
+  num_nodes = 3  # Number of nodes
+  emb_dim = 4    # Embedding dimension
+  block_size = 1#256  # Define block size based on your GPU architecture
+  grid_size = (num_edges + block_size - 1) // block_size
+
+
+  # Create random embeddings and adjacency list
+  neighbor_node_embeddings = torch.rand((num_edges, emb_dim), dtype=torch.float32).cuda()  # Shape: [num_edges, emb_dim]
+  theta_edge = torch.rand((num_edges, emb_dim), dtype=torch.float32).cuda()      # Shape: [num_edges, emb_dim]
+  aggregated_edge_messages = torch.zeros((num_nodes, emb_dim), dtype=torch.float32).cuda()  # Shape: [num_nodes, emb_dim]
+
+  # Adjacency list: shape [2, num_edges]
+  edge_index_list = torch.tensor([[0, 1, 1, 2, 0],   # Destination indices
+                                [0, 1, 2, 1, 2]],  # Source indices
+                               dtype=torch.int32).cuda()
+  # Host code to check counter
+  invocation_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
+  _propogate_messages[(grid_size,)](      
+      neighbor_node_embeddings, theta_edge, 
+      aggregated_edge_messages, edge_index_list, num_edges, invocation_counter,  # Pass the pointer to the counter            
+      BLOCK_SIZE=block_size)
+  ###############################################################################
+
   best_mae = float('inf')
-  save_path = 'best_model.pt'
+  save_path = 'best_model.pt'  
   for epoch in range(num_epochs): 
     total_loss = 0.0           
     iteration = 0
@@ -627,6 +680,9 @@ if __name__ == '__main__':
       forward_start_time = time.time()           
       node_forces = gamdnet.forward(pos, edge_index_list) # [b * num_nodes, 3], [e, 2], [b * num_nodes] -> [b * num_nodes, 3]
       forward_end_time = time.time()      
+      iterations_per_sec = 1.0 / (forward_end_time - forward_start_time)
+      print("PNET iterations per second: ", iterations_per_sec )
+      #exit(0)
       force_loss = criterion(node_forces, force) # [b * num_nodes, 3], [b * num_nodes, 3] -> [1]
       optimizer.zero_grad()
       force_loss.backward()
