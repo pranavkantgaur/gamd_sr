@@ -148,17 +148,30 @@ class MDDataset(Dataset):
     
     # create edge index list , [num_edges, 2]
     if self.neighborlist_has_been_init == False:
+      neighbors_allocate_start_time = time.time()
       self.last_neighbor_list_obj = self.neighbor_list_fn.allocate(pos) # [num nodes, num of neighbors for that node]    
+      neighbors_allocate_end_time = time.time()
+      #print("Neighbor allocate time: ", neighbors_allocate_end_time - neighbors_allocate_start_time)
       self.neighborlist_has_been_init = True
       #print("INFO: INIT CALLED")
-    else:
-      self.last_neighbor_list_obj = self.neighbor_list_fn_jit.update(pos, self.last_neighbor_list_obj)
+    else:      
+      neighbors_update_start_time = time.time()
+      #self.last_neighbor_list_obj = self.neighbor_list_fn_jit.update(pos, self.last_neighbor_list_obj)
+      self.last_neighbor_list_obj = self.neighbor_list_fn_jit(pos, self.last_neighbor_list_obj)
+      neighbors_update_end_time = time.time()
+      #print("Neighbor update time: ", neighbors_update_end_time - neighbors_update_start_time)
       #print("INFO: Update called")
       if self.last_neighbor_list_obj.did_buffer_overflow:
         self.last_neighbor_list_obj = self.neighbor_list_fn.allocate(pos)      
     neighbor_indices = self.last_neighbor_list_obj.idx
+    edge_mask_start_time = time.time()
     edge_mask_all = self.masking_fn(pos, neighbor_indices)
+    edge_mask_end_time = time.time()
+    #print("Edge masking time: ", edge_mask_end_time - edge_mask_start_time)
+    get_edge_idx_start_time = time.time()
     edge_index = self.get_edge_idx(self.last_neighbor_list_obj, pos, edge_mask_all).long()
+    get_edge_idx_end_time = time.time()
+    #print("Get edge idx function call time: ", get_edge_idx_end_time - get_edge_idx_start_time)    
 
     return edge_index
   
@@ -168,18 +181,21 @@ class MDDataset(Dataset):
     return pos - offset, offset
 
   def __getitem__(self, idx):
-    get_item_start_time = time.time()
+    #get_item_start_time = time.time()
     idx = self.idx[idx]
     sample_num = 1000
     sample_to_read = idx % sample_num
     seed = idx // sample_num
     # TODO: DEBUG: SET FOR TRACING EXECUTION FOR THIS SAMPLE. TO BE REMOVED.
     #seed = 5
-    #sample_to_read = 611
+    #sample_to_read = 215
     
     data_file = f'ljdata_{seed}_{sample_to_read}.npz'
     print(f"Reading {data_file}...")
     data = np.load(os.path.join(self.data_dir, data_file))
+    get_item_end_time = time.time()
+    #print(f"Get item time: {get_item_end_time - get_item_start_time}")
+    
 
     # Extract and convert data
 
@@ -201,13 +217,12 @@ class MDDataset(Dataset):
       force = torch.einsum("bi,ij->bj", force, rotation_matrix)  # Apply rotation to force as well      
 
     # apply random jittering to positions: https://github.com/BaratiLab/GAMD/blob/main/code/LJ/train_network_lj.py#L228       
-    #pos = pos + torch.randn_like(pos) * 0.005
-    edge_start_time = time.time()
-    edge_index = self._get_edge_index_using_jax_md(pos)    
-    edge_end_time = time.time()
-    get_item_end_time = time.time()
-    #print(f"Get item time: {get_item_end_time - get_item_start_time}")
-    #print(f"Edge index time: {edge_end_time - edge_start_time}")
+    #pos = pos + torch.randn_like(pos) * 0.005    
+    edge_id_start_time = time.time()
+    edge_index = self._get_edge_index_using_jax_md(pos)         
+    edge_id_end_time = time.time()    
+    #print(f"Edge index time: {edge_id_end_time - edge_id_start_time}")
+    #exit(0)
     return pos, edge_index, force
 
 
@@ -235,32 +250,36 @@ def _propogate_messages(src_node_embeddings_ptr, edge_embeddings_ptr,
     dest_node_messages_ptr,
     adjacency_list_ptr, 
     num_edges,
-    invocation_counter_ptr,  # Pointer to atomic counter
     BLOCK_SIZE: tl.constexpr      
   ):
   # Get the unique thread ID
-  tid = tl.program_id(0)
+  pid = tl.program_id(axis = 0)  
+  #print("PID is: ", pid)
   #print("TID is: ", tid)
-  #print("Num edges are: ", num_edges)
-  if tid < num_edges:
-      #print("YESYSYSYSYSY")
-      # Load destination node index from adjacency list (0th row)
-      dest_node_idx = tl.load(adjacency_list_ptr + tid)  # Use load instead of direct indexing
 
-      # Load edge embedding
-      edge_embedding = tl.load(edge_embeddings_ptr + tid)  
+  #print("Num edges are: ", num_edges)
+  if pid < num_edges:
+      # Load destination node index from adjacency list (0th row)
+      offsets = pid * tl.constexpr(1) + tl.arange(0, 1)
+      mask = offsets < num_edges 
+      # Load tensor values
+      dest_node_idx = tl.load(adjacency_list_ptr + offsets, mask=mask)            
+
+      edge_embedding = tl.load(edge_embeddings_ptr + offsets, mask=mask)  
       
       # Load source node embedding for this edge
-      src_embedding = tl.load(src_node_embeddings_ptr + tid) #+ src_node_idx)  # Use src_node_idx for correct loading
+      src_embedding = tl.load(src_node_embeddings_ptr + offsets, mask=mask) #+ src_node_idx)  # Use src_node_idx for correct loading
       
       # Compute the message as the product of source node embedding and edge embedding
       message = src_embedding * edge_embedding
       
-      # Aggregate the message into destination node messages using atomic addition
+      #print("Writing to: ", dest_node_idx)
+      # Aggregate the message into destination node messages using atomic addition      
       tl.atomic_add(dest_node_messages_ptr + dest_node_idx, message)
+      debug = tl.load(dest_node_messages_ptr + dest_node_idx)
+      #print("value: ", debug)
       
-      # Increment the atomic counter
-      tl.atomic_add(invocation_counter_ptr, 1)      
+      
 
 class MPBlock(nn.Module):
     def __init__(self, embed_dim, hidden_dim):
@@ -320,28 +339,30 @@ class MPBlock(nn.Module):
         sum_tensor = edge_embeddings + center_node_embeddings + neighbor_node_embeddings
         theta_edge = self.phi(sum_tensor)        
         
-        
-        # Launching the kernel
-        block_size = 1#256  # Define block size based on your GPU architecture
-        num_edges = theta_edge.shape[0]        
-        grid_size = (num_edges + block_size - 1) // block_size        
-        #print("Grid size: ", grid_size)
-        aggregated_edge_messages = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
-        # Host code to check counter
-        invocation_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
-        _propogate_messages[(grid_size,)](      
-            neighbor_node_embeddings, theta_edge, 
-            aggregated_edge_messages, edge_index_list, num_edges, invocation_counter,  # Pass the pointer to the counter            
-            BLOCK_SIZE=block_size)
         '''
-        # Check if all threads were invoked
-        if invocation_counter.item() == num_edges:
-            print("All thread IDs were invoked.")
-        else:
-            print(f"Only {invocation_counter.item()} out of {num_edges} thread IDs were invoked.")        
+        # Launching the kernel
+        num_edges = theta_edge.shape[0]        
+        block_size = 32  # Define block size based on your GPU architecture        
+        grid_size = num_edges#(num_edges + block_size - 1) // block_size        
+        #print("Grid size: ", grid_size)
+        
+        aggregated_edge_messages_triton = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
+ 
+        _propogate_messages[(grid_size, )](      
+            neighbor_node_embeddings, theta_edge, 
+            aggregated_edge_messages_triton, edge_index_list, num_edges,  # Pass the pointer to the counter            
+            BLOCK_SIZE=block_size)
+        
+        
+        '''
+        aggregated_edge_messages_torch_vectorized = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
+
         
         edge_message_neigh_center = (neighbor_node_embeddings * theta_edge)#.to(torch.float16)  # Convert to float16        
+        aggregated_edge_messages_torch_vectorized.index_add_(0, center_node_index, edge_message_neigh_center)  # Accumulate messages into AGG
+        
 
+        '''
         # Collect edge messages received by each node
         node_edge_messages = [[torch.zeros(node_embeddings.shape[1]).to(device)] for _ in range(node_embeddings.shape[0])]  # Use float16
         
@@ -360,12 +381,28 @@ class MPBlock(nn.Module):
             [torch.sum(torch.stack(row), dim=0).unsqueeze(0) for row in node_edge_messages],
             dim=0
         )#.to(torch.float16)  # Ensure the result is float16
-        '''
+
+        if torch.allclose(aggregated_edge_messages, aggregated_edge_messages_torch_vectorized):
+          print("Same aggregate messages")
+        else:
+          print("Different aggregate messages")
+          print("old: ", aggregated_edge_messages)
+          print("torch vectorized: ", aggregated_edge_messages_torch_vectorized)
+          close_mask = torch.isclose(aggregated_edge_messages, aggregated_edge_messages_torch_vectorized)
+          # Find indices where elements are not close
+          different_indices = torch.nonzero(~close_mask).squeeze()
+          print("Indices of different elements:", different_indices)
+          print("old's value: ", aggregated_edge_messages[162, 108])
+          print("torch vectorized's value: ", aggregated_edge_messages_torch_vectorized[162, 108])
+        exit(0)
+        
+        
         #print(f"INFO: theta edge before PHI: {theta_edge[150]}")
         #print(f"INFO: edge embeddings before PHI: {edge_embeddings[150]}")
         #print(f"INFO before PHI: node embeddings: {node_embeddings[150]}, aggregated edge mesage: {aggregated_edge_messages[150]}")
         #print("Edge index list before PHI: ", edge_index_list.shape, edge_index_list[0, 350], edge_index_list[1, 350])
-        node_embeddings = self.theta(node_embeddings + aggregated_edge_messages)  
+        '''
+        node_embeddings = self.theta(node_embeddings + aggregated_edge_messages_torch_vectorized)  
         #mpblock_end_time = time.time()
         #print("MPBLOCK time: ", mpblock_end_time - mpblock_start_time)
         return node_embeddings
@@ -468,10 +505,10 @@ class GAMDNet(nn.Module):
         num_nodes = pos.shape[0]                
         node_embeddings = self.node_embeddings.repeat((num_nodes, 1)).to(device)
         #print(f"INFO: node_embeddings: {node_embeddings[100]}, edge embeddings: {edge_embeddings[100]}, edge list: {edge_index_list[:, 100]}")
-        mpnn_start_time = time.time()
+        #mpnn_start_time = time.time()
         node_embeddings = self.mpnn_mlps(node_embeddings, edge_embeddings, edge_index_list) # L blocks of weights (L sequential MLPs),         
-        mpnn_end_time = time.time()
-        print("MPNN time: ", mpnn_end_time - mpnn_start_time)
+        #mpnn_end_time = time.time()
+        #print("MPNN time: ", mpnn_end_time - mpnn_start_time)
         #exit(0)
         node_forces = self.force_pred_mlp(node_embeddings) # weights, mlp, [b * num_nodes, embed_dim] -> [b * num_nodes, 3]
         
@@ -636,38 +673,8 @@ if __name__ == '__main__':
   writer = SummaryWriter()
   #print_model_summary(gamdnet, writer)
   #exit(0)
-
-  ############################################################################################
-  # Launching the kernel
-        
-  #print("Grid size: ", grid_size)  
-  # Example parameters
-  num_edges = 5  # Number of edges
-  num_nodes = 3  # Number of nodes
-  emb_dim = 4    # Embedding dimension
-  block_size = 1#256  # Define block size based on your GPU architecture
-  grid_size = (num_edges + block_size - 1) // block_size
-
-
-  # Create random embeddings and adjacency list
-  neighbor_node_embeddings = torch.rand((num_edges, emb_dim), dtype=torch.float32).cuda()  # Shape: [num_edges, emb_dim]
-  theta_edge = torch.rand((num_edges, emb_dim), dtype=torch.float32).cuda()      # Shape: [num_edges, emb_dim]
-  aggregated_edge_messages = torch.zeros((num_nodes, emb_dim), dtype=torch.float32).cuda()  # Shape: [num_nodes, emb_dim]
-
-  # Adjacency list: shape [2, num_edges]
-  edge_index_list = torch.tensor([[0, 1, 1, 2, 0],   # Destination indices
-                                [0, 1, 2, 1, 2]],  # Source indices
-                               dtype=torch.int32).cuda()
-  # Host code to check counter
-  invocation_counter = torch.zeros(1, dtype=torch.int32, device='cuda')
-  _propogate_messages[(grid_size,)](      
-      neighbor_node_embeddings, theta_edge, 
-      aggregated_edge_messages, edge_index_list, num_edges, invocation_counter,  # Pass the pointer to the counter            
-      BLOCK_SIZE=block_size)
-  ###############################################################################
-
   best_mae = float('inf')
-  save_path = 'best_model.pt'  
+  save_path = 'best_model_vectorized_message_passing.pt'  
   for epoch in range(num_epochs): 
     total_loss = 0.0           
     iteration = 0
@@ -677,12 +684,7 @@ if __name__ == '__main__':
       pos = pos.to(device)
       edge_index_list = edge_index_list.to(device)
       force = force.to(device)      
-      forward_start_time = time.time()           
       node_forces = gamdnet.forward(pos, edge_index_list) # [b * num_nodes, 3], [e, 2], [b * num_nodes] -> [b * num_nodes, 3]
-      forward_end_time = time.time()      
-      iterations_per_sec = 1.0 / (forward_end_time - forward_start_time)
-      print("PNET iterations per second: ", iterations_per_sec )
-      #exit(0)
       force_loss = criterion(node_forces, force) # [b * num_nodes, 3], [b * num_nodes, 3] -> [1]
       optimizer.zero_grad()
       force_loss.backward()
