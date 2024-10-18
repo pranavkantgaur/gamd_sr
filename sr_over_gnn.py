@@ -36,10 +36,11 @@ import torch
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+from monolithic_gamd_impl import *
 
 
 
-def are_aggregate_edge_msgs_gt_force_correlated(gamdnet = None, dataloader = None, msg_force_dict = None):
+def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict = None):
     '''
     gamdnet: pytorch model
     dataloader: pytorch dataloader
@@ -125,7 +126,6 @@ def are_aggregate_edge_msgs_gt_force_correlated(gamdnet = None, dataloader = Non
     return are_correlated
 
 
-from monolithic_gamd_impl import *
 
 def load_model_and_dataset(model_filename, md_filedir):
     '''
@@ -147,20 +147,50 @@ def load_model_and_dataset(model_filename, md_filedir):
     gamdnet.eval()
     
     print("Model weights loaded successfully.")
-
-    '''
-    num_input_files = len(os.listdir(md_filedir))
-    dataset = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data, val_idx) 
-    dataloader = DataLoader(dataset, batch_size=num_input_files, shuffle=False, collate_fn=custom_collate)
     
-    '''
-    dataloader = None
+
+    train_data_fraction = 1.0 # select 9k for training
+    avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
+    rotation_aug = False # online rotation augmentation for a frame    
+    # create train data-loader
+    return_train_data = True
+    num_input_files = len(os.listdir(md_filedir))
+    batch_size = num_input_files # number of graphs in a batch
+    print("Loading input files: ", num_input_files)
+    dataset = MDDataset(md_filedir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+    print("Dataloader initialized.")    
+    
     return gamdnet, dataloader
 
 #print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
 
 
-model_weights_filename = 'best_model.pt'#'best_model_vectorized_message_passing.pt'
+
+
+def get_msg_force_dict(gamdnet, dataloader):
+    msg_force_dict = None
+    
+    # run inference over the input batched graph from dataloader
+    # record aggregate edge messages and force ground truths for each node in output dictionary
+
+    # register forward hooks to capture aggregate messages TODO
+    
+    with torch.no_grad():  # Disable gradient calculation for inference
+        model_output = gamdnet(input_data)  # Forward pass through the model
+
+
+
+    
+    return msg_force_dict
+
+
+
+
+
+model_weights_filename = 'best_model_vectorized_message_passing.pt'
 md_filedir = 'sr_inputs'
 gamdnet, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
-#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated(gamdnet, dataloader))
+#msg_force_dict = get_msg_force_dict(gamdnetm, dataloader)
+
+#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict))
