@@ -131,19 +131,36 @@ def load_model_and_dataset(model_filename, md_filedir):
     '''
     Load model and MD dataset for SR from input filename and dataset directory.
     '''
-    gamdnet = 
+    embed_dim = 128 
+    hidden_dim = 128
+    num_mpnn_layers = 4 # as per paper, for LJ system
+    num_mlp_layers = 3
+    num_atom_type_classes = 1 # Ar atoms only
+    num_edge_types = 1 # non-bonded edges only
+    num_rbfs = 10 # RBF expansion of interatomic distance vector of each edge to num_rbfs dimensions
+    gamdnet = GAMDNet(embed_dim, hidden_dim, num_mpnn_layers, num_mlp_layers, num_atom_type_classes, num_edge_types, num_rbfs).to(device)  
+    # Load the weights from 'model.pt'
+    # Load the checkpoint from 'model.pt'
+    checkpoint = torch.load(model_filename)
+    gamdnet.load_state_dict(checkpoint['model_state_dict'])
+    # Set the model to evaluation mode
+    gamdnet.eval()
+    
+    print("Model weights loaded successfully.")
+
+    '''
     num_input_files = len(os.listdir(md_filedir))
     dataset = MDDataset(data_dir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data, val_idx) 
     dataloader = DataLoader(dataset, batch_size=num_input_files, shuffle=False, collate_fn=custom_collate)
     
-    
-    dataloader = 
+    '''
+    dataloader = None
     return gamdnet, dataloader
 
 #print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
 
 
-model_weights_filename = 'best_model_vectorized_message_passing.pt'
+model_weights_filename = 'best_model.pt'#'best_model_vectorized_message_passing.pt'
 md_filedir = 'sr_inputs'
 gamdnet, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
-print("Result: ", are_aggregate_edge_msgs_gt_force_correlated(gamdnet, dataloader))
+#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated(gamdnet, dataloader))
