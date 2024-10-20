@@ -40,65 +40,24 @@ from monolithic_gamd_impl import *
 
 
 
-def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict = None):
+def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict):
     '''
-    gamdnet: pytorch model
-    dataloader: pytorch dataloader
-    msg_force_dict: [filename, node_id, aggregate_message, gt_force]
-    '''   
+    msg_force_dict: {'aggregate_edge_messages': [total_edges, emb_dim], 'gt_force': [num_particles * batch_size, 3]}
+    '''
 
-    # result variable
-    are_correlated = False
-    
-
-    # Example dictionary structure with nested access
-    msg_force_dict = {
-        'file1': {
-            '220': {
-                'agg_msg': torch.randn(1, 128),  # Example tensor
-                'gt_force': torch.randn(1, 3)     # Example tensor
-            }
-        },
-        'file2': {
-            '221': {
-                'agg_msg': torch.randn(1, 128),
-                'gt_force': torch.randn(1, 3)
-            }
-        },
-        # Add more entries as needed
-    }
-
-    # Step 1: Prepare lists to collect aggregate_message and gt_force values
-    all_agg_msg_values = []
-    all_gt_force_values = []
-
-    # Collecting data for variance calculation and regression
-    for filename, nodes in msg_force_dict.items():
-        for node_id, data in nodes.items():
-            aggregate_message = data['agg_msg']
-            gt_force = data['gt_force']
-
-            # Append the aggregate message tensor to the list
-            all_agg_msg_values.append(aggregate_message.flatten().numpy())  # Convert to numpy array
-            all_gt_force_values.append(gt_force.flatten().numpy())          # Convert to numpy array
-
-    # Convert lists to numpy arrays for further processing
-    all_agg_msg_values = np.array(all_agg_msg_values)  # Shape: (num_samples, 128)
-    all_gt_force_values = np.array(all_gt_force_values)  # Shape: (num_samples, 3)
-
-    # Step 2: Calculate variance for each component of agg_msg across all samples
-    variances = np.var(all_agg_msg_values, axis=0)  # Variance for each component
+    # Calculate variance for each component of agg_msg across all samples
+    msg_comp_variances = torch.var(msg_force_dict['aggregate_edge_messages'], axis=0)  # Variance for each component
 
     # Step 3: Get top-3 indices based on variance
-    top_indices = np.argsort(variances)[-3:]  # Get indices of top-3 components with maximum variance
+    top_var_indices = torch.argsort(msg_comp_variances)[-3:]  # Get indices of top-3 components with maximum variance
 
     # Output the results of top-3 components
     print("Top-3 components with maximum variance:")
-    for index in top_indices:
-        print(f"Component Index: {index}, Variance: {variances[index]}")
+    for index in top_var_indices:
+        print(f"Component Index: {index}, Variance: {top_var_indices[index]}")
 
     # Step 4: Prepare data for linear regression using top-3 components as output variables
-    agg_msg_selected_values = all_agg_msg_values[:, top_indices]  # Select only the top-3 components
+    agg_msg_selected_values = msg_force_dict['aggregate_edge_messages'][:, top_indices]  # Select only the top-3 components
 
     # Step 5: Performing linear regression for each selected agg_msg component against gt_force
     r2_threshold = 0.7  # Set your threshold here
@@ -107,24 +66,41 @@ def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict = None):
         model = LinearRegression()
         
         # Fit model to predict selected agg_msg component based on gt_force components
-        model.fit(all_gt_force_values, agg_msg_selected_values[:, component_index])
+        model.fit(msg_force_dict['force_gt'], agg_msg_selected_values[:, component_index])
         
         slope = model.coef_
         intercept = model.intercept_
         
         # Calculate R^2 score
-        predictions = model.predict(all_gt_force_values)
-        r2 = r2_score(agg_msg_selected_values[:, component_index], predictions)
+        predictions = model.predict(msg_force_dict['force_gt'])
+        r2 = r2_score(msg_force_dict['aggregate_edge_messages'][:, component_index], predictions)
         
         print(f"\nLinear fit results for Component {component_index + 1}:")
         print(f"Slope: {slope}, Intercept: {intercept}, R^2 Score: {r2}")
 
-    # Check goodness of fit against threshold
-    if r2 > r2_threshold:
-        are_correlated = True 
-
+        # Check goodness of fit against threshold
+        if r2 > r2_threshold:
+            are_correlated = True 
+        else:
+            are_correlated = False
+            break
     return are_correlated
 
+# add updated forward for MPBlock class
+def new_forward(self, node_embeddings, edge_embeddings, edge_index_list): 
+    node_embeddings = self.layer_norm(node_embeddings) # [b * num_nodes, embed_dim]     
+    center_node_index = edge_index_list[0, :] # [1, e] 
+    neighbor_node_index = edge_index_list[1, :] # [1, e]
+    center_node_embeddings = node_embeddings[center_node_index]
+    neighbor_node_embeddings = node_embeddings[neighbor_node_index]
+    sum_tensor = edge_embeddings + center_node_embeddings + neighbor_node_embeddings
+    theta_edge = self.phi(sum_tensor)        
+    aggregated_edge_messages_torch_vectorized = torch.zeros((node_embeddings.shape[0], theta_edge.shape[1]), dtype=torch.float32).cuda()
+    edge_message_neigh_center = (neighbor_node_embeddings * theta_edge)#.to(torch.float16)  # Convert to float16        
+    aggregated_edge_messages_torch_vectorized.index_add_(0, center_node_index, edge_message_neigh_center)  # Accumulate messages into AGG
+    self.aggregated_edge_messages = aggregated_edge_messages_torch_vectorized        
+    node_embeddings = self.theta(node_embeddings + aggregated_edge_messages_torch_vectorized)  
+    return node_embeddings
 
 
 def load_model_and_dataset(model_filename, md_filedir):
@@ -166,22 +142,16 @@ def load_model_and_dataset(model_filename, md_filedir):
 #print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
 
 
-
-
 def get_msg_force_dict(gamdnet, dataloader):
     msg_force_dict = None
-    
     # run inference over the input batched graph from dataloader
     # record aggregate edge messages and force ground truths for each node in output dictionary
-
-    # register forward hooks to capture aggregate messages TODO
-    
-    with torch.no_grad():  # Disable gradient calculation for inference
-        model_output = gamdnet(input_data)  # Forward pass through the model
-
-
-
-    
+    for pos, edge_index_list, force_gt in dataloader:
+        with torch.no_grad():  # Disable gradient calculation for inference
+            gamdnet.mpnn.mpblock[3].forward = new_forward # monkey-patch for saving aggregate edge messages
+            model_output = gamdnet(pos, edge_index_list)  # Forward pass through the model
+            msg_force_dict['aggregagte_edge_messages'] = gamdnet.mpnn.mpblock[3].aggregate_edge_messages # [total_edges, emb_dim]
+            msg_force_dict['force_gt'] = force_gt # [num_particle * batch_size, 3]
     return msg_force_dict
 
 
