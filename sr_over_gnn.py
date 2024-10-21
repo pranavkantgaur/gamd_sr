@@ -110,8 +110,10 @@ class MPBlock(nn.Module):
         aggregated_edge_messages_torch_vectorized.index_add_(0, center_node_index, edge_message_neigh_center)  # Accumulate messages into AGG
         
 
-        node_embeddings = self.theta(node_embeddings + aggregated_edge_messages_torch_vectorized)  
-        self.aggregate_edge_messages = aggregated_edge_messages_torch_vectorized
+        node_embeddings = self.theta(node_embeddings + aggregated_edge_messages_torch_vectorized)          
+        
+        self.edge_message_neigh_center = edge_message_neigh_center # for symbolic regression
+        
         return node_embeddings
 
 
@@ -212,27 +214,29 @@ class GAMDNet(nn.Module):
         return node_forces
 
 
-def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict):
+def are_edge_msgs_gt_force_correlated(msg_force_dict):
     '''
-    msg_force_dict: {'aggregate_edge_messages': [total_edges, emb_dim], 'gt_force': [num_particles * batch_size, 3]}
+    msg_force_dict: {'edge_messages': [total_edges, emb_dim], 'gt_force': [total_edges, 3]}
     '''
+
+    print("edge message shape: ", msg_force_dict['edge_messages'].shape)
+    print("force shape: ", msg_force_dict['force_gt'].shape)
+
     # Calculate variance for each component of agg_msg across all samples
-    msg_comp_variances = torch.var(msg_force_dict['aggregate_edge_messages'], axis=0)  # Variance for each component
+    msg_comp_std = torch.std(msg_force_dict['edge_messages'], axis=0)  # Variance for each component
 
     # Step 3: Get top-3 indices based on variance
-    top_var_indices = torch.argsort(msg_comp_variances)[-10:]  # Get indices of top-3 components with maximum variance
+    top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance
 
     # Output the results of top-3 components
-    print("Top-3 components with maximum variance are: ", top_var_indices)
-    print("Variances: ", msg_comp_variances[top_var_indices])
+    print("Top-3 components with maximum STD are: ", top_std_indices)
+    print("std values: ", msg_comp_std[top_std_indices])
     
 
-    # Step 4: Prepare data for linear regression using top-3 components as output variables
-    agg_msg_selected_values = msg_force_dict['aggregate_edge_messages'][:, top_var_indices]  # Select only the top-3 components
+    # Prepare data for linear regression using top-3 components as output variables
+    agg_msg_selected_values = msg_force_dict['edge_messages'][:, top_std_indices]  # Select only the top-3 components
 
-    # Step 5: Performing linear regression for each selected agg_msg component against gt_force
-    r2_threshold = 0.7  # Set your threshold here
-
+    # Performing linear regression for each selected agg_msg component against gt_force
     for component_index in range(3):
         model = LinearRegression()
         
@@ -244,18 +248,10 @@ def are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict):
         
         # Calculate R^2 score
         predictions = model.predict(msg_force_dict['force_gt'].cpu())
-        r2 = r2_score(msg_force_dict['aggregate_edge_messages'][:, component_index].cpu(), predictions)
+        r2 = r2_score(msg_force_dict['edge_messages'][:, component_index].cpu(), predictions)
         
         print(f"\nLinear fit results for Component {component_index + 1}:")
         print(f"Slope: {slope}, Intercept: {intercept}, R^2 Score: {r2}")
-
-        # Check goodness of fit against threshold
-        '''
-        if r2 > r2_threshold:
-            are_correlated = are_correlated and True 
-        else:
-            are_correlated = False            
-        '''
     are_correlated = False
     return are_correlated
 
@@ -299,6 +295,42 @@ def load_model_and_dataset(model_filename, md_filedir):
 #print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
 
 
+def compute_lj_force(pos, edge_index_list):
+    
+    center_node_idx = edge_index_list[0, :]
+    neigh_node_idx = edge_index_list[1, :]
+
+    neigh_node_pos = pos[neigh_node_idx]
+    center_node_pos = pos[center_node_idx]
+
+    # Calculate the distance vector
+    r_vec = neigh_node_pos - center_node_pos  # Shape: [n, 3]
+    
+    # Calculate the distance (magnitude)
+    r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
+
+    # Avoid division by zero
+    r = torch.where(r == 0, torch.tensor(1e-10, dtype=r.dtype), r)
+    
+    epsilon = 1.0
+    sigma = 1.0
+
+    force_magnitude = 24 * epsilon * (
+        2 * (sigma ** 12) / (r ** 13) - 
+        (sigma ** 6) / (r ** 7)
+    )  # Shape: [n, 1]
+
+    # Calculate the force vector (directed)
+    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]
+
+    return force_vector
+
+
+
+
+
+
+
 def get_msg_force_dict(gamdnet, dataloader):
     msg_force_dict = {}
     # run inference over the input batched graph from dataloader
@@ -306,12 +338,15 @@ def get_msg_force_dict(gamdnet, dataloader):
     for pos, edge_index_list, force_gt in dataloader:
         with torch.no_grad():  # Disable gradient calculation for inference            
             force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
-            msg_force_dict['aggregate_edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].aggregate_edge_messages
-            msg_force_dict['force_gt'] = force_gt # [num_particle * batch_size, 3]
-            evaluate(force_gt, force_pred)            
+            evaluate(force_gt, force_pred)
+            
+            # record messages for SR
+            lj_force = compute_lj_force(pos, edge_index_list)
+            msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center
+            msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
+                        
         break # run dataloader only once
     return msg_force_dict
-
 
 
 
@@ -321,4 +356,4 @@ md_filedir = '../top/'
 gamdnet, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, dataloader)
 
-print("Result: ", are_aggregate_edge_msgs_gt_force_correlated(msg_force_dict))
+print("Result: ", are_edge_msgs_gt_force_correlated(msg_force_dict))
