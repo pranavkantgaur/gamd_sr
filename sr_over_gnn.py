@@ -322,11 +322,10 @@ def compute_lj_force(pos, edge_index_list):
 
     # Calculate the force vector (directed)
     force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]
+    
+    force_vector = torch.nan_to_num(force_vector, nan=0.0)
 
     return force_vector
-
-
-
 
 
 
