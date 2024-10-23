@@ -41,6 +41,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from monolithic_gamd_impl import MDDataset, custom_collate, evaluate
+import dgl
+import dgl.function as fn
+from typing import List, Set, Dict, Tuple, Optional
+import random
+import time
+from sklearn.preprocessing import StandardScaler
 
 # check for CUDA device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -295,36 +301,35 @@ class SmoothConvLayerNew(nn.Module):
         if self.update_edge_emb:
             self.edge_layer_norm = nn.LayerNorm(in_edge_feats)
 
-        # TODO-10: Whether edge_affine and src, dst affine matters?
-        #self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
-        #self.src_affine = nn.Linear(in_node_feats, hidden_dim)
-        #self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
-        # Set the seed
-        seed = 10
-
-        # PyTorch seed
-        torch.manual_seed(seed)        
+        # self.theta_src = nn.Linear(in_node_feats, hidden_dim)
+        self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
+        self.src_affine = nn.Linear(in_node_feats, hidden_dim)
+        self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
         self.theta_edge = MLP(hidden_dim, in_node_feats,
                               hidden_dim=hidden_dim, activation=activation, activation_first=True,
                               hidden_layer=2)
         # self.theta = MLP(hidden_dim, hidden_dim, activation_first=True, hidden_layer=2)
-        
-        # TODO-12: Whether phi_dst, phi_edge matter? NOT MUCH.
-        #self.phi_dst = nn.Linear(in_node_feats, hidden_dim)
-        #self.phi_edge = nn.Linear(in_node_feats, hidden_dim)
-        
-        # Set the seed
-        seed = 10
 
-        # PyTorch seed
-        torch.manual_seed(seed)        
-
+        self.phi_dst = nn.Linear(in_node_feats, hidden_dim)
+        self.phi_edge = nn.Linear(in_node_feats, hidden_dim)
         self.phi = MLP(hidden_dim, out_node_feats,
                        activation_first=True, hidden_layer=1, hidden_dim=hidden_dim, activation=activation)
 
     def forward(self, g: dgl.DGLGraph, node_feat: torch.Tensor) -> torch.Tensor:
-        h = node_feat.clone().to('cuda:0')
+        h = node_feat.clone()
         with g.local_scope():
+            if self.drop_edge and self.training:
+                src_idx, dst_idx = g.edges()
+                e_feat = g.edata['e'].clone()
+                dropout_ratio = 0.2
+                idx = np.arange(dst_idx.shape[0])
+                np.random.shuffle(idx)
+                keep_idx = idx[:-int(idx.shape[0] * dropout_ratio)]
+                src_idx = src_idx[keep_idx]
+                dst_idx = dst_idx[keep_idx]
+                e_feat = e_feat[keep_idx]
+                g = dgl.graph((src_idx, dst_idx))
+                g.edata['e'] = e_feat
             # for multi batch training
             if g.is_block:
                 h_src = h
@@ -337,19 +342,21 @@ class SmoothConvLayerNew(nn.Module):
             edge_idx = g.edges()
             src_idx = edge_idx[0]
             dst_idx = edge_idx[1]
-            
-            
-            edge_code = g.edata['e']
-            src_code = h_src[src_idx]
-            dst_code = h_dst[dst_idx]
-            g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)     
+            edge_code = self.edge_affine(g.edata['e'])
+            src_code = self.src_affine(h_src[src_idx])
+            dst_code = self.dst_affine(h_dst[dst_idx])
+            g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)
             
             self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR
-
-            g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))            
+            
+            if self.update_edge_emb:
+                normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
+            g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
             edge_emb = g.ndata['h']
-        
-        node_feat = self.phi(h + edge_emb)
+
+        if self.update_edge_emb:
+            g.edata['e'] = normalized_e_emb
+        node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb))
         return node_feat
 
 
@@ -395,26 +402,78 @@ class SmoothConvBlockNew(nn.Module):
                                                  activation=activation,
                                                  drop_edge=drop_edge,
                                                  update_edge_emb=update_egde_emb))
-            ## TODO-8: Whether layer norm matters?            
             if use_layer_norm:
-                # Set the seed
-                seed = 10
-
-                # PyTorch seed
-                torch.manual_seed(seed)                
                 self.norm_layers.append(nn.LayerNorm(out_node_feats))
             elif use_batch_norm:
                 self.norm_layers.append(nn.BatchNorm1d(out_node_feats))
-            
+
     def forward(self, h: torch.Tensor, graph: dgl.DGLGraph) -> torch.Tensor:
 
         for l, conv_layer in enumerate(self.conv):
             if self.use_layer_norm or self.use_batch_norm:
-                h = conv_layer.forward(graph, self.norm_layers[l](h)) + h                
+                h = conv_layer.forward(graph, self.norm_layers[l](h)) + h
             else:
                 h = conv_layer.forward(graph, h) + h
-            
+
         return h
+
+
+# code from DGL documents
+class RBFExpansion(nn.Module):
+    r"""Expand distances between nodes by radial basis functions.
+
+    .. math::
+        \exp(- \gamma * ||d - \mu||^2)
+
+    where :math:`d` is the distance between two nodes and :math:`\mu` helps centralizes
+    the distances. We use multiple centers evenly distributed in the range of
+    :math:`[\text{low}, \text{high}]` with the difference between two adjacent centers
+    being :math:`gap`.
+
+    The number of centers is decided by :math:`(\text{high} - \text{low}) / \text{gap}`.
+    Choosing fewer centers corresponds to reducing the resolution of the filter.
+
+    Parameters
+    ----------
+    low : float
+        Smallest center. Default to 0.
+    high : float
+        Largest center. Default to 30.
+    gap : float
+        Difference between two adjacent centers. :math:`\gamma` will be computed as the
+        reciprocal of gap. Default to 0.1.
+    """
+    def __init__(self, low=0., high=30., gap=0.1):
+        super(RBFExpansion, self).__init__()
+
+        num_centers = int(np.ceil((high - low) / gap))
+        self.centers = np.linspace(low, high, num_centers)
+        self.centers = nn.Parameter(torch.tensor(self.centers).float(), requires_grad=False)
+        self.gamma = 1 / gap
+
+    def reset_parameters(self):
+        """Reinitialize model parameters."""
+        device = self.centers.device
+        self.centers = nn.Parameter(
+            self.centers.clone().detach().float(), requires_grad=False).to(device)
+
+    def forward(self, edge_dists):
+        """Expand distances.
+
+        Parameters
+        ----------
+        edge_dists : float32 tensor of shape (E, 1)
+            Distances between end nodes of edges, E for the number of edges.
+
+        Returns
+        -------
+        float32 tensor of shape (E, len(self.centers))
+            Expanded distances.
+        """
+        radial = edge_dists - self.centers
+        coef = - self.gamma
+        return torch.exp(coef * (radial ** 2))
+
 
 
 class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
@@ -440,26 +499,22 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
                                              activation='silu')
 
         self.edge_emb_dim = edge_embedding_dim
+        self.edge_expand = RBFExpansion(high=1, gap=0.025)
+        self.edge_drop_out = nn.Dropout(dropout)
+
+        self.length_mean = nn.Parameter(torch.tensor([0.]), requires_grad=False)
+        self.length_std = nn.Parameter(torch.tensor([1.]), requires_grad=False)
+        self.length_scaler = StandardScaler()
 
         if isinstance(box_size, np.ndarray):
             self.box_size = torch.from_numpy(box_size).float()
         else:
             self.box_size = box_size
         self.box_size = self.box_size
-        # Set the seed
-        seed = 10
 
-        # PyTorch seed
-        torch.manual_seed(seed)        
         self.node_emb = nn.Parameter(torch.randn((1, encoding_size)), requires_grad=True)
-        # Set the seed
-        seed = 10
-
-        # PyTorch seed
-        torch.manual_seed(seed)                                     
-        self.edge_encoder = MLP(3, self.edge_emb_dim, hidden_dim=hidden_dim,
-                                activation='gelu')                
-        # TODO-5: Whether edge layer norm matters? YES
+        self.edge_encoder = MLP(3 + 1 + len(self.edge_expand.centers), self.edge_emb_dim, hidden_dim=hidden_dim,
+                                activation='gelu')
         self.edge_layer_norm = nn.LayerNorm(self.edge_emb_dim)
         self.graph_decoder = MLP(encoding_size, out_feats, hidden_layer=2, hidden_dim=hidden_dim, activation='gelu')
 
@@ -469,15 +524,31 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
                        pos_src: torch.Tensor,
                        pos_dst=None) -> torch.Tensor:
         # this is the raw input feature
-        
+
         # to enhance computation performance, dont track their calculation on graph
         if pos_dst is None:
             pos_dst = pos_src
 
         with torch.no_grad():
-
             rel_pos = pos_dst[dst_idx.long()] - pos_src[src_idx.long()]
-        edge_feat = rel_pos
+            if isinstance(self.box_size, torch.Tensor):
+                rel_pos_periodic = torch.remainder(rel_pos + 0.5 * self.box_size.to(rel_pos.device),
+                                                   self.box_size.to(rel_pos.device)) - 0.5 * self.box_size.to(rel_pos.device)
+            else:
+                rel_pos_periodic = torch.remainder(rel_pos + 0.5 * self.box_size,
+                                                   self.box_size) - 0.5 * self.box_size
+
+            rel_pos_norm = rel_pos_periodic.norm(dim=1).view(-1, 1)  # [edge_num, 1]
+            rel_pos_periodic /= rel_pos_norm + 1e-8   # normalized
+
+        if self.training:
+            self.fit_length(rel_pos_norm)
+            self._update_length_stat(self.length_scaler.mean_, np.sqrt(self.length_scaler.var_))
+
+        rel_pos_norm = (rel_pos_norm - self.length_mean) / self.length_std
+        edge_feat = torch.cat((rel_pos_periodic,
+                               rel_pos_norm,
+                               self.edge_expand(rel_pos_norm)), dim=1)
         return edge_feat
 
     def build_graph(self,
@@ -489,11 +560,14 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
         neigh_idx = fluid_edge_idx[1, :]
         fluid_graph = dgl.graph((neigh_idx, center_idx))
         fluid_edge_feat = self.calc_edge_feat(center_idx, neigh_idx, fluid_pos)
-        fluid_edge_emb = self.edge_layer_norm(self.edge_encoder(fluid_edge_feat))  # [edge_num, 64]
 
-        # Move edge features to cuda:0
-        edge_features = fluid_edge_emb.to('cuda:0')        
-        fluid_graph.edata['e'] = edge_features  # Now assign edge features
+        fluid_edge_emb = self.edge_layer_norm(self.edge_encoder(fluid_edge_feat))  # [edge_num, 64]
+        fluid_edge_emb = self.edge_drop_out(fluid_edge_emb)
+        fluid_graph.edata['e'] = fluid_edge_emb
+
+        # add self loop for fluid particles
+        if self_loop:
+            fluid_graph.add_self_loop()
         return fluid_graph
 
     def build_graph_batches(self, pos_lst, edge_idx_lst):
@@ -522,8 +596,9 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
         else:
             fluid_graph = self.build_graph(fluid_edge_lst[0], fluid_pos_lst[0])
         num = np.sum([pos.shape[0] for pos in fluid_pos_lst])
-        x = self.node_emb.repeat((num, 1))          
+        x = self.node_emb.repeat((num, 1))
         x = self.graph_conv(x, fluid_graph)
+
         x = self.graph_decoder(x)
         return x
 
@@ -532,10 +607,11 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
 
 
 ############################################ prepare inputs for testing linearity hypothesis ###############################################
-
 def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkpoint_filename, md_filedir):
     '''
     Load model and MD dataset for SR from input filename and dataset directory.
+    '''
+
     '''
     embed_dim = 128 
     hidden_dim = 128
@@ -553,7 +629,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     gamdnet.eval()
     
     print("GAMD model weights loaded successfully.")
-    
+    '''
     train_data_fraction = 1.0 # select 9k for training
     avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
     rotation_aug = False # online rotation augmentation for a frame    
@@ -568,7 +644,6 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     print("Dataloader initialized.")   
 
 
-
     print("Loading official GAMDNET...") 
     param_dict = {
                 'encoding_size': 128,
@@ -580,20 +655,27 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
                 'use_layer_norm': True,
                 'box_size': 27.27,
                 }
-    gamdnet_official = SimpleMDNetNew(**param_dict)     
+    gamdnet_official = SimpleMDNetNew(**param_dict).to(device)   
+    checkpoint = torch.load(gamdnet_official_model_checkpoint_filename)    
     
-    #checkpoint = pytorch_lightning.load(gamdnet_official_model_checkpoint_filename)
-    #gamdnet_official.load_state_dict(checkpoint['model_state_dict'])
+    state_dict_original = checkpoint['state_dict']
+
+    # Define the prefix to remove
+    prefix_to_remove = 'pnet_model.'
+
+    # Create a new dictionary with updated keys
+    state_dict_without_prefix = {
+        key[len(prefix_to_remove):]: value 
+        for key, value in state_dict_original.items() 
+        if key.startswith(prefix_to_remove)
+    }
     
-    #print("GAMD official model weights loaded successfully.")
+    gamdnet_official.load_state_dict(state_dict_without_prefix)
+    
+    print("GAMD official model weights loaded successfully.")
     
     gamdnet_official.eval()
-
-
-    return gamdnet, gamdnet_official, dataloader
-
-#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
-
+    return None, gamdnet_official, dataloader
 
 
 def compute_lj_force(pos, edge_index_list):
@@ -613,9 +695,8 @@ def compute_lj_force(pos, edge_index_list):
     # Avoid division by zero
     r = torch.where(r == 0, torch.tensor(1e-10, dtype=r.dtype), r)
     
-    epsilon = 0.006
-    sigma = 0.0001
-
+    epsilon = 0.238
+    sigma = 3.4 
     force_magnitude = 24 * epsilon * (
         2 * (sigma ** 12) / (r ** 13) - 
         (sigma ** 6) / (r ** 7)
@@ -628,25 +709,29 @@ def compute_lj_force(pos, edge_index_list):
 
 
 
-
-def get_msg_force_dict(gamdnet, dataloader):
+def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
     msg_force_dict = {}
     # run inference over the input batched graph from dataloader
     # record aggregate edge messages and force ground truths for each node in output dictionary
     for pos, edge_index_list, force_gt in dataloader:
         with torch.no_grad():  # Disable gradient calculation for inference            
             # our implementation
-            force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
-            evaluate(force_gt, force_pred)
-            
+            #force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
+            #msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center 
+            # Now, unload model 1 from GPU before inference on model 2
+            #del gamdnet  # Delete the reference to model 1
+
+            #evaluate(force_gt, force_pred)            
             # official implementation
-            force_pred_official = mdnet()
+            force_pred_official = gamdnet_official([pos],
+                               [edge_index_list])
             print("Results from official model:")
             evaluate(force_gt, force_pred_official)
+            
             # record messages for SR
             lj_force = compute_lj_force(pos, edge_index_list)
-            msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center            
-            msg_force_dict['edge_messages_official'] = mdnet.graph_conv.conv[-1].edge_message_neigh_center
+                       
+            msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center
             msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
                         
         break # run dataloader only once
@@ -704,10 +789,15 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
 
 
 
+
+
+
+
+
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
 md_filedir = '../top/'
-gamdnet, gamdnet_official, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
-msg_force_dict = get_msg_force_dict(gamdnet, dataloader)
+gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
+msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 
 print("Result: ", are_edge_msgs_gt_force_correlated(msg_force_dict))
