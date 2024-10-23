@@ -32,7 +32,9 @@
 4. How to relate predicted equation with LJ interparticle force equation?
     1. **TBD later**
 '''
+
 import numpy as np
+import matplotlib.pyplot as  plt
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 import torch
@@ -43,6 +45,8 @@ from monolithic_gamd_impl import MDDataset, custom_collate, evaluate
 # check for CUDA device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device is: ", device)
+
+
 
 
 class MPBlock(nn.Module):
@@ -214,6 +218,445 @@ class GAMDNet(nn.Module):
         return node_forces
 
 
+
+
+
+## OFFICIAL gamd implementation
+class MLP(nn.Module):
+    def __init__(self,
+                 in_feats,
+                 out_feats,
+                 hidden_dim=128,
+                 hidden_layer=3,
+                 activation_first=False,
+                 activation='relu',
+                 init_param=False):
+        super(MLP, self).__init__()
+        if activation == 'relu':
+            act_fn = nn.ReLU()
+        elif activation == 'leaky_relu':
+            act_fn = nn.LeakyReLU(0.2)
+        elif activation == 'sigmoid':
+            act_fn = nn.Sigmoid()
+        elif activation == 'tanh':
+            act_fn = nn.Tanh()
+        elif activation == 'elu':
+            act_fn = nn.ELU()
+        elif activation == 'gelu':
+            act_fn = nn.GELU()
+        elif activation == 'silu':
+            act_fn = nn.SiLU()
+        else:
+            raise Exception('Only support: relu, leaky_relu, sigmoid, tanh, elu, as non-linear activation')
+
+        mlp_layer = []
+        for l in range(hidden_layer):
+            if l != hidden_layer-1 and l != 0:
+                mlp_layer += [nn.Linear(hidden_dim, hidden_dim), act_fn]
+            elif l == 0:
+                if hidden_layer == 1:
+                    if activation_first:
+                        mlp_layer += [act_fn, nn.Linear(in_feats, out_feats)]
+                    else:
+                        print('Using MLP with no hidden layer and activations! Fall back to nn.Linear()')
+                        mlp_layer += [nn.Linear(in_feats, out_feats)]
+                elif not activation_first:
+                    mlp_layer += [nn.Linear(in_feats, hidden_dim), act_fn]
+                else:
+                    mlp_layer += [act_fn, nn.Linear(in_feats, hidden_dim), act_fn]
+            else:   # l == hidden_layer-1
+                mlp_layer += [nn.Linear(hidden_dim, out_feats)]
+        self.mlp_layer = nn.Sequential(*mlp_layer)
+        if init_param:
+            self._init_parameters()
+
+    def _init_parameters(self):
+        for layer in self.mlp_layer:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+
+    def forward(self, feat):
+        return self.mlp_layer(feat.to('cuda:0'))
+
+
+class SmoothConvLayerNew(nn.Module):
+    def __init__(self,
+                 in_node_feats,
+                 in_edge_feats,
+                 out_node_feats,
+                 hidden_dim=128,
+                 activation='relu',
+                 drop_edge=True,
+                 update_edge_emb=False):
+
+        super(SmoothConvLayerNew, self).__init__()
+        self.drop_edge = drop_edge
+        self.update_edge_emb = update_edge_emb
+        if self.update_edge_emb:
+            self.edge_layer_norm = nn.LayerNorm(in_edge_feats)
+
+        # TODO-10: Whether edge_affine and src, dst affine matters?
+        #self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
+        #self.src_affine = nn.Linear(in_node_feats, hidden_dim)
+        #self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
+        # Set the seed
+        seed = 10
+
+        # PyTorch seed
+        torch.manual_seed(seed)        
+        self.theta_edge = MLP(hidden_dim, in_node_feats,
+                              hidden_dim=hidden_dim, activation=activation, activation_first=True,
+                              hidden_layer=2)
+        # self.theta = MLP(hidden_dim, hidden_dim, activation_first=True, hidden_layer=2)
+        
+        # TODO-12: Whether phi_dst, phi_edge matter? NOT MUCH.
+        #self.phi_dst = nn.Linear(in_node_feats, hidden_dim)
+        #self.phi_edge = nn.Linear(in_node_feats, hidden_dim)
+        
+        # Set the seed
+        seed = 10
+
+        # PyTorch seed
+        torch.manual_seed(seed)        
+
+        self.phi = MLP(hidden_dim, out_node_feats,
+                       activation_first=True, hidden_layer=1, hidden_dim=hidden_dim, activation=activation)
+
+    def forward(self, g: dgl.DGLGraph, node_feat: torch.Tensor) -> torch.Tensor:
+        h = node_feat.clone().to('cuda:0')
+        with g.local_scope():
+            # for multi batch training
+            if g.is_block:
+                h_src = h
+                h_dst = h[:g.number_of_dst_nodes()]
+            else:
+                h_src = h_dst = h
+
+            g.srcdata['h'] = h_src
+            g.dstdata['h'] = h_dst
+            edge_idx = g.edges()
+            src_idx = edge_idx[0]
+            dst_idx = edge_idx[1]
+            
+            
+            edge_code = g.edata['e']
+            src_code = h_src[src_idx]
+            dst_code = h_dst[dst_idx]
+            g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)     
+            
+            self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR
+
+            g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))            
+            edge_emb = g.ndata['h']
+        
+        node_feat = self.phi(h + edge_emb)
+        return node_feat
+
+
+class SmoothConvBlockNew(nn.Module):
+    def __init__(self,
+                 in_node_feats,
+                 out_node_feats,
+                 hidden_dim=128,
+                 conv_layer=3,
+                 edge_emb_dim=64,
+                 use_layer_norm=False,
+                 use_batch_norm=True,
+                 drop_edge=False,
+                 activation='relu',
+                 update_egde_emb=False,
+                 ):
+        super(SmoothConvBlockNew, self).__init__()
+        self.conv = nn.ModuleList()
+        self.edge_emb_dim = edge_emb_dim
+        self.use_layer_norm = use_layer_norm
+        self.use_batch_norm = use_batch_norm
+
+        self.drop_edge = drop_edge
+        if use_batch_norm == use_layer_norm and use_batch_norm:
+            raise Exception('Only one type of normalization at a time')
+        if use_layer_norm or use_batch_norm:
+            self.norm_layers = nn.ModuleList()
+
+        for layer in range(conv_layer):
+            if layer == 0:
+                self.conv.append(SmoothConvLayerNew(in_node_feats=in_node_feats,
+                                                 in_edge_feats=self.edge_emb_dim,
+                                                 out_node_feats=out_node_feats,
+                                                 hidden_dim=hidden_dim,
+                                                 activation=activation,
+                                                 drop_edge=drop_edge,
+                                                 update_edge_emb=update_egde_emb))
+            else:
+                self.conv.append(SmoothConvLayerNew(in_node_feats=out_node_feats,
+                                                 in_edge_feats=self.edge_emb_dim,
+                                                 out_node_feats=out_node_feats,
+                                                 hidden_dim=hidden_dim,
+                                                 activation=activation,
+                                                 drop_edge=drop_edge,
+                                                 update_edge_emb=update_egde_emb))
+            ## TODO-8: Whether layer norm matters?            
+            if use_layer_norm:
+                # Set the seed
+                seed = 10
+
+                # PyTorch seed
+                torch.manual_seed(seed)                
+                self.norm_layers.append(nn.LayerNorm(out_node_feats))
+            elif use_batch_norm:
+                self.norm_layers.append(nn.BatchNorm1d(out_node_feats))
+            
+    def forward(self, h: torch.Tensor, graph: dgl.DGLGraph) -> torch.Tensor:
+
+        for l, conv_layer in enumerate(self.conv):
+            if self.use_layer_norm or self.use_batch_norm:
+                h = conv_layer.forward(graph, self.norm_layers[l](h)) + h                
+            else:
+                h = conv_layer.forward(graph, h) + h
+            
+        return h
+
+
+class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
+    def __init__(self,
+                 encoding_size,
+                 out_feats,
+                 box_size,   # can also be array
+                 hidden_dim=128,
+                 conv_layer=4,
+                 edge_embedding_dim=128,
+                 dropout=0.1,
+                 drop_edge=True,
+                 use_layer_norm=False):
+        super(SimpleMDNetNew, self).__init__()
+        self.graph_conv = SmoothConvBlockNew(in_node_feats=encoding_size,
+                                             out_node_feats=encoding_size,
+                                             hidden_dim=hidden_dim,
+                                             conv_layer=conv_layer,
+                                             edge_emb_dim=edge_embedding_dim,
+                                             use_layer_norm=use_layer_norm,
+                                             use_batch_norm=not use_layer_norm,
+                                             drop_edge=drop_edge,
+                                             activation='silu')
+
+        self.edge_emb_dim = edge_embedding_dim
+
+        if isinstance(box_size, np.ndarray):
+            self.box_size = torch.from_numpy(box_size).float()
+        else:
+            self.box_size = box_size
+        self.box_size = self.box_size
+        # Set the seed
+        seed = 10
+
+        # PyTorch seed
+        torch.manual_seed(seed)        
+        self.node_emb = nn.Parameter(torch.randn((1, encoding_size)), requires_grad=True)
+        # Set the seed
+        seed = 10
+
+        # PyTorch seed
+        torch.manual_seed(seed)                                     
+        self.edge_encoder = MLP(3, self.edge_emb_dim, hidden_dim=hidden_dim,
+                                activation='gelu')                
+        # TODO-5: Whether edge layer norm matters? YES
+        self.edge_layer_norm = nn.LayerNorm(self.edge_emb_dim)
+        self.graph_decoder = MLP(encoding_size, out_feats, hidden_layer=2, hidden_dim=hidden_dim, activation='gelu')
+
+    def calc_edge_feat(self,
+                       src_idx: torch.Tensor,
+                       dst_idx: torch.Tensor,
+                       pos_src: torch.Tensor,
+                       pos_dst=None) -> torch.Tensor:
+        # this is the raw input feature
+        
+        # to enhance computation performance, dont track their calculation on graph
+        if pos_dst is None:
+            pos_dst = pos_src
+
+        with torch.no_grad():
+
+            rel_pos = pos_dst[dst_idx.long()] - pos_src[src_idx.long()]
+        edge_feat = rel_pos
+        return edge_feat
+
+    def build_graph(self,
+                    fluid_edge_idx: torch.Tensor,
+                    fluid_pos: torch.Tensor,
+                    self_loop=True) -> dgl.DGLGraph:
+
+        center_idx = fluid_edge_idx[0, :]  # [edge_num, 1]
+        neigh_idx = fluid_edge_idx[1, :]
+        fluid_graph = dgl.graph((neigh_idx, center_idx))
+        fluid_edge_feat = self.calc_edge_feat(center_idx, neigh_idx, fluid_pos)
+        fluid_edge_emb = self.edge_layer_norm(self.edge_encoder(fluid_edge_feat))  # [edge_num, 64]
+
+        # Move edge features to cuda:0
+        edge_features = fluid_edge_emb.to('cuda:0')        
+        fluid_graph.edata['e'] = edge_features  # Now assign edge features
+        return fluid_graph
+
+    def build_graph_batches(self, pos_lst, edge_idx_lst):
+        graph_lst = []
+        for pos, edge_idx in zip(pos_lst, edge_idx_lst):
+            graph = self.build_graph(edge_idx, pos)
+            graph_lst += [graph]
+        batched_graph = dgl.batch(graph_lst)
+        return batched_graph
+
+    def _update_length_stat(self, new_mean, new_std):
+        self.length_mean[0] = new_mean[0]
+        self.length_std[0] = new_std[0]
+
+    def fit_length(self, length):
+        if not isinstance(length, np.ndarray):
+            length = length.detach().cpu().numpy().reshape(-1, 1)
+        self.length_scaler.partial_fit(length)
+
+    def forward(self,
+                fluid_pos_lst: List[torch.Tensor],  # list of [N, 3]
+                fluid_edge_lst: List[torch.Tensor]
+                ) -> torch.Tensor:
+        if len(fluid_pos_lst) > 1:
+            fluid_graph = self.build_graph_batches(fluid_pos_lst, fluid_edge_lst)
+        else:
+            fluid_graph = self.build_graph(fluid_edge_lst[0], fluid_pos_lst[0])
+        num = np.sum([pos.shape[0] for pos in fluid_pos_lst])
+        x = self.node_emb.repeat((num, 1))          
+        x = self.graph_conv(x, fluid_graph)
+        x = self.graph_decoder(x)
+        return x
+
+
+
+
+
+############################################ prepare inputs for testing linearity hypothesis ###############################################
+
+def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkpoint_filename, md_filedir):
+    '''
+    Load model and MD dataset for SR from input filename and dataset directory.
+    '''
+    embed_dim = 128 
+    hidden_dim = 128
+    num_mpnn_layers = 4 # as per paper, for LJ system
+    num_mlp_layers = 3
+    num_atom_type_classes = 1 # Ar atoms only
+    num_edge_types = 1 # non-bonded edges only
+    num_rbfs = 10 # RBF expansion of interatomic distance vector of each edge to num_rbfs dimensions
+    gamdnet = GAMDNet(embed_dim, hidden_dim, num_mpnn_layers, num_mlp_layers, num_atom_type_classes, num_edge_types, num_rbfs).to(device)  
+    # Load the weights from 'model.pt'
+    # Load the checkpoint from 'model.pt'
+    checkpoint = torch.load(gamdnet_model_filename)
+    gamdnet.load_state_dict(checkpoint['model_state_dict'])
+    # Set the model to evaluation mode
+    gamdnet.eval()
+    
+    print("GAMD model weights loaded successfully.")
+    
+    train_data_fraction = 1.0 # select 9k for training
+    avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
+    rotation_aug = False # online rotation augmentation for a frame    
+    # create train data-loader
+    return_train_data = True
+    num_input_files = 100#len(os.listdir(md_filedir))
+    batch_size = num_input_files # number of graphs in a batch
+    print("Loading input files: ", num_input_files)
+    #print("Files are: ", os.listdir(md_filedir))
+    dataset = MDDataset(md_filedir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+    print("Dataloader initialized.")   
+
+
+
+    print("Loading official GAMDNET...") 
+    param_dict = {
+                'encoding_size': 128,
+                'out_feats': 3,
+                'hidden_dim': 128,
+                'edge_embedding_dim': 128,
+                'conv_layer': 4,
+                'drop_edge': False,
+                'use_layer_norm': True,
+                'box_size': 27.27,
+                }
+    gamdnet_official = SimpleMDNetNew(**param_dict)     
+    
+    #checkpoint = pytorch_lightning.load(gamdnet_official_model_checkpoint_filename)
+    #gamdnet_official.load_state_dict(checkpoint['model_state_dict'])
+    
+    #print("GAMD official model weights loaded successfully.")
+    
+    gamdnet_official.eval()
+
+
+    return gamdnet, gamdnet_official, dataloader
+
+#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
+
+
+
+def compute_lj_force(pos, edge_index_list):
+    
+    center_node_idx = edge_index_list[0, :]
+    neigh_node_idx = edge_index_list[1, :]
+
+    neigh_node_pos = pos[neigh_node_idx]
+    center_node_pos = pos[center_node_idx]
+
+    # Calculate the distance vector
+    r_vec = neigh_node_pos - center_node_pos  # Shape: [n, 3]
+    
+    # Calculate the distance (magnitude)
+    r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
+
+    # Avoid division by zero
+    r = torch.where(r == 0, torch.tensor(1e-10, dtype=r.dtype), r)
+    
+    epsilon = 0.006
+    sigma = 0.0001
+
+    force_magnitude = 24 * epsilon * (
+        2 * (sigma ** 12) / (r ** 13) - 
+        (sigma ** 6) / (r ** 7)
+    )  # Shape: [n, 1]
+
+    # Calculate the force vector (directed)
+    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]    
+    force_vector = torch.nan_to_num(force_vector, nan=0.0)
+    return force_vector
+
+
+
+
+def get_msg_force_dict(gamdnet, dataloader):
+    msg_force_dict = {}
+    # run inference over the input batched graph from dataloader
+    # record aggregate edge messages and force ground truths for each node in output dictionary
+    for pos, edge_index_list, force_gt in dataloader:
+        with torch.no_grad():  # Disable gradient calculation for inference            
+            # our implementation
+            force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
+            evaluate(force_gt, force_pred)
+            
+            # official implementation
+            force_pred_official = mdnet()
+            print("Results from official model:")
+            evaluate(force_gt, force_pred_official)
+            # record messages for SR
+            lj_force = compute_lj_force(pos, edge_index_list)
+            msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center            
+            msg_force_dict['edge_messages_official'] = mdnet.graph_conv.conv[-1].edge_message_neigh_center
+            msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
+                        
+        break # run dataloader only once
+    return msg_force_dict
+
+
+
+
+################################################################ test linearity hypothesis #################################
+
 def are_edge_msgs_gt_force_correlated(msg_force_dict):
     '''
     msg_force_dict: {'edge_messages': [total_edges, emb_dim], 'gt_force': [total_edges, 3]}
@@ -252,107 +695,19 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
         
         print(f"\nLinear fit results for Component {component_index + 1}:")
         print(f"Slope: {slope}, Intercept: {intercept}, R^2 Score: {r2}")
+        x = predictions
+        y = msg_force_dict['edge_messages'][:, component_index].cpu() 
+        plt.plot(x, y)
+        plt.show()
     are_correlated = False
     return are_correlated
 
 
-def load_model_and_dataset(model_filename, md_filedir):
-    '''
-    Load model and MD dataset for SR from input filename and dataset directory.
-    '''
-    embed_dim = 128 
-    hidden_dim = 128
-    num_mpnn_layers = 4 # as per paper, for LJ system
-    num_mlp_layers = 3
-    num_atom_type_classes = 1 # Ar atoms only
-    num_edge_types = 1 # non-bonded edges only
-    num_rbfs = 10 # RBF expansion of interatomic distance vector of each edge to num_rbfs dimensions
-    gamdnet = GAMDNet(embed_dim, hidden_dim, num_mpnn_layers, num_mlp_layers, num_atom_type_classes, num_edge_types, num_rbfs).to(device)  
-    # Load the weights from 'model.pt'
-    # Load the checkpoint from 'model.pt'
-    checkpoint = torch.load(model_filename)
-    gamdnet.load_state_dict(checkpoint['model_state_dict'])
-    # Set the model to evaluation mode
-    gamdnet.eval()
-    
-    print("Model weights loaded successfully.")
-    
-    train_data_fraction = 1.0 # select 9k for training
-    avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
-    rotation_aug = False # online rotation augmentation for a frame    
-    # create train data-loader
-    return_train_data = True
-    num_input_files = 100#len(os.listdir(md_filedir))
-    batch_size = num_input_files # number of graphs in a batch
-    print("Loading input files: ", num_input_files)
-    #print("Files are: ", os.listdir(md_filedir))
-    dataset = MDDataset(md_filedir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
-    print("Dataloader initialized.")    
-    
-    return gamdnet, dataloader
 
-#print("Result: ", are_aggregate_edge_msgs_gt_force_correlated())
-
-
-def compute_lj_force(pos, edge_index_list):
-    
-    center_node_idx = edge_index_list[0, :]
-    neigh_node_idx = edge_index_list[1, :]
-
-    neigh_node_pos = pos[neigh_node_idx]
-    center_node_pos = pos[center_node_idx]
-
-    # Calculate the distance vector
-    r_vec = neigh_node_pos - center_node_pos  # Shape: [n, 3]
-    
-    # Calculate the distance (magnitude)
-    r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
-
-    # Avoid division by zero
-    r = torch.where(r == 0, torch.tensor(1e-10, dtype=r.dtype), r)
-    
-    epsilon = 1.0
-    sigma = 1.0
-
-    force_magnitude = 24 * epsilon * (
-        2 * (sigma ** 12) / (r ** 13) - 
-        (sigma ** 6) / (r ** 7)
-    )  # Shape: [n, 1]
-
-    # Calculate the force vector (directed)
-    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]
-    
-    force_vector = torch.nan_to_num(force_vector, nan=0.0)
-
-    return force_vector
-
-
-
-
-def get_msg_force_dict(gamdnet, dataloader):
-    msg_force_dict = {}
-    # run inference over the input batched graph from dataloader
-    # record aggregate edge messages and force ground truths for each node in output dictionary
-    for pos, edge_index_list, force_gt in dataloader:
-        with torch.no_grad():  # Disable gradient calculation for inference            
-            force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
-            evaluate(force_gt, force_pred)
-            
-            # record messages for SR
-            lj_force = compute_lj_force(pos, edge_index_list)
-            msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center
-            msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
-                        
-        break # run dataloader only once
-    return msg_force_dict
-
-
-
-
-model_weights_filename = 'best_model_vectorized_message_passing.pt'
+gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
+gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
 md_filedir = '../top/'
-gamdnet, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
+gamdnet, gamdnet_official, dataloader = load_model_and_dataset(model_weights_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, dataloader)
 
 print("Result: ", are_edge_msgs_gt_force_correlated(msg_force_dict))
