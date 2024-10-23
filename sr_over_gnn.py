@@ -624,7 +624,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     # Load the weights from 'model.pt'
     # Load the checkpoint from 'model.pt'
     checkpoint = torch.load(gamdnet_model_filename)
-    gamdnet.load_state_dict(checkpoint['model_state_dict'])
+    gamdnet.load_state_dict(checkpoint['model_state_dict'], weights_only=True)
     # Set the model to evaluation mode
     gamdnet.eval()
     
@@ -742,10 +742,54 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
 
 ################################################################ test linearity hypothesis #################################
 
+from scipy.optimize import minimize
+
+msg_most_imp = None
+expected_forces = None
+
+def percentile_sum(x):
+    x = x.ravel()
+    bot = x.min()
+    top = np.percentile(x, 90)
+    msk = (x>=bot) & (x<=top)
+    frac_good = (msk).sum()/len(x)
+    return x[msk].sum()/frac_good
+
+
+def linear_transformation_3d(alpha):
+
+    global msg_most_imp
+
+    lincomb1 = (alpha[0] * expected_forces[:, 0] + alpha[1] * expected_forces[:, 1] + alpha[2] * expected_forces[:, 2]) + alpha[3]
+    lincomb2 = (alpha[0+4] * expected_forces[:, 0] + alpha[1+4] * expected_forces[:, 1] + alpha[2+4] * expected_forces[:, 2]) + alpha[3+4]
+    lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]
+
+    score = (
+        percentile_sum(np.square(msg_most_imp[:, 0] - lincomb1)) +
+        percentile_sum(np.square(msg_most_imp[:, 1] - lincomb2)) +
+        percentile_sum(np.square(msg_most_imp[:, 2] - lincomb3))
+    )/3.0
+
+    return score
+
+
+def out_linear_transformation_3d(alpha):
+
+    lincomb1 = (alpha[0] * expected_forces[:, 0] + alpha[1] * expected_forces[:, 1] + alpha[2] * expected_forces[:, 2]) + alpha[3]
+    lincomb2 = (alpha[0+4] * expected_forces[:, 0] + alpha[1+4] * expected_forces[:, 1] + alpha[2+4] * expected_forces[:, 2]) + alpha[3+4]
+    lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]
+
+    return lincomb1, lincomb2, lincomb3
+
+
+
+
 def are_edge_msgs_gt_force_correlated(msg_force_dict):
     '''
     msg_force_dict: {'edge_messages': [total_edges, emb_dim], 'gt_force': [total_edges, 3]}
     '''
+    global msg_most_imp
+    global expected_forces
 
     print("edge message shape: ", msg_force_dict['edge_messages'].shape)
     print("force shape: ", msg_force_dict['force_gt'].shape)
@@ -757,33 +801,28 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
     top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance
 
     # Output the results of top-3 components
-    print("Top-3 components with maximum STD are: ", top_std_indices)
-    print("std values: ", msg_comp_std[top_std_indices])
+    #print("Top-3 components with maximum STD are: ", top_std_indices)
+    #print("std values: ", msg_comp_std[top_std_indices])
     
 
     # Prepare data for linear regression using top-3 components as output variables
-    agg_msg_selected_values = msg_force_dict['edge_messages'][:, top_std_indices]  # Select only the top-3 components
+    msg_most_imp = msg_force_dict['edge_messages'][:, top_std_indices]  # Select only the top-3 components
 
-    # Performing linear regression for each selected agg_msg component against gt_force
-    for component_index in range(3):
-        model = LinearRegression()
-        
-        # Fit model to predict selected agg_msg component based on gt_force components
-        model.fit(msg_force_dict['force_gt'].cpu(), agg_msg_selected_values[:, component_index].cpu())
-        
-        slope = model.coef_
-        intercept = model.intercept_
-        
-        # Calculate R^2 score
-        predictions = model.predict(msg_force_dict['force_gt'].cpu())
-        r2 = r2_score(msg_force_dict['edge_messages'][:, component_index].cpu(), predictions)
-        
-        print(f"\nLinear fit results for Component {component_index + 1}:")
-        print(f"Slope: {slope}, Intercept: {intercept}, R^2 Score: {r2}")
-        x = predictions
-        y = msg_force_dict['edge_messages'][:, component_index].cpu() 
-        plt.plot(x, y)
+    
+    # normalize the messages
+    msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
+    expected_forces = msg_force_dict['force_gt'].cpu()
+
+    dim = 3
+    min_result = minimize(linear_transformation_3d, np.ones(dim**2 + dim), method='Powell')
+
+    # Visualize the fit
+    for i in range(dim):
+        px = out_linear_transformation_3d(min_result.x)[i]
+        py = msg_most_imp[:, i]
+        plt.plot(px, py)
         plt.show()
+
     are_correlated = False
     return are_correlated
 
