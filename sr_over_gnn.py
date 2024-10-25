@@ -624,7 +624,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     # Load the weights from 'model.pt'
     # Load the checkpoint from 'model.pt'
     checkpoint = torch.load(gamdnet_model_filename)
-    gamdnet.load_state_dict(checkpoint['model_state_dict'], weights_only=True)
+    gamdnet.load_state_dict(checkpoint['model_state_dict'])
     # Set the model to evaluation mode
     gamdnet.eval()
     
@@ -635,7 +635,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     rotation_aug = False # online rotation augmentation for a frame    
     # create train data-loader
     return_train_data = True
-    num_input_files = 100#len(os.listdir(md_filedir))
+    num_input_files = 1#len(os.listdir(md_filedir))
     batch_size = num_input_files # number of graphs in a batch
     print("Loading input files: ", num_input_files)
     #print("Files are: ", os.listdir(md_filedir))
@@ -643,7 +643,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
     print("Dataloader initialized.")   
 
-
+    
     print("Loading official GAMDNET...") 
     param_dict = {
                 'encoding_size': 128,
@@ -675,11 +675,25 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     print("GAMD official model weights loaded successfully.")
     
     gamdnet_official.eval()
+    
+    #return gamdnet, None, dataloader
     return None, gamdnet_official, dataloader
 
 
 def compute_lj_force(pos, edge_index_list):
     
+ 
+    # Find columns where both rows have the same index
+    same_index_columns = (edge_index_list[0] == edge_index_list[1])        
+
+    #print("Number of edges before: ", edge_index_list.shape)    
+    # Remove these columns from the original index tensor
+    #edge_index_list = edge_index_list[:, ~same_index_columns]
+    
+    #print("Number of edges after: ", edge_index_list.shape)    
+    
+    #exit(0)
+ 
     center_node_idx = edge_index_list[0, :]
     neigh_node_idx = edge_index_list[1, :]
 
@@ -691,21 +705,24 @@ def compute_lj_force(pos, edge_index_list):
     
     # Calculate the distance (magnitude)
     r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
-
-    # Avoid division by zero
-    r = torch.where(r == 0, torch.tensor(1e-10, dtype=r.dtype), r)
     
     epsilon = 0.238
     sigma = 3.4 
-    force_magnitude = 24 * epsilon * (
-        2 * (sigma ** 12) / (r ** 13) - 
-        (sigma ** 6) / (r ** 7)
+    force_magnitude = 48 * epsilon * (
+        ((sigma ** 12) / (r ** 13)) - 
+        ((sigma ** 6) / (r ** 7))
     )  # Shape: [n, 1]
 
     # Calculate the force vector (directed)
-    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]    
-    force_vector = torch.nan_to_num(force_vector, nan=0.0)
-    return force_vector
+    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]     
+    
+    nan_mask = torch.isnan(force_vector).any(dim=1)
+    valid_indices = ~nan_mask    
+    
+    # Filter tensor_a using the mask
+    #valid_indices = valid_indices & same_index_columns
+
+    return force_vector, r, valid_indices
 
 
 
@@ -716,24 +733,46 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
     for pos, edge_index_list, force_gt in dataloader:
         with torch.no_grad():  # Disable gradient calculation for inference            
             # our implementation
-            #force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
-            #msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center 
-            # Now, unload model 1 from GPU before inference on model 2
-            #del gamdnet  # Delete the reference to model 1
-
-            #evaluate(force_gt, force_pred)            
+            '''
+            force_pred = gamdnet(pos, edge_index_list)  # Forward pass through the model
+            msg_force_dict['edge_messages'] = gamdnet.mpnn_mlps.mp_blocks[3].edge_message_neigh_center                        
+            evaluate(force_gt, force_pred)            
+            '''
             # official implementation
             force_pred_official = gamdnet_official([pos],
                                [edge_index_list])
+            msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center                               
             print("Results from official model:")
             evaluate(force_gt, force_pred_official)
             
             # record messages for SR
-            lj_force = compute_lj_force(pos, edge_index_list)
-                       
-            msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center
+            lj_force, radial_distance, valid_indices = compute_lj_force(pos, edge_index_list)                                 
+
+            
+            # remove nans
+            lj_force = lj_force[valid_indices]
+            msg_force_dict['edge_messages'] = msg_force_dict['edge_messages'][valid_indices]
+            msg_force_dict['radial_distance'] = radial_distance[valid_indices]
+            
+            # Define a threshold for closeness to zero
+            threshold = 1e-5
+
+            # Identify rows where all elements are close to zero
+            close_to_zero_rows = (torch.abs(lj_force) < threshold).all(dim=1)
+
+            # Create a mask for rows that are NOT close to zero
+            non_zero_rows_mask = ~close_to_zero_rows
+
+            
+            
+            print("Before zero row removal, ", lj_force.shape, msg_force_dict['edge_messages'].shape)
+            # Filter the tensor to keep only the non-zero rows
+            lj_force = lj_force[non_zero_rows_mask]                     
+            msg_force_dict['edge_messages'] = msg_force_dict['edge_messages'][non_zero_rows_mask]                                  
             msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
-                        
+            msg_force_dict['radial_distance'] = msg_force_dict['radial_distance'][non_zero_rows_mask]
+            
+
         break # run dataloader only once
     return msg_force_dict
 
@@ -759,7 +798,8 @@ def percentile_sum(x):
 def linear_transformation_3d(alpha):
 
     global msg_most_imp
-
+    global expected_forces
+    
     lincomb1 = (alpha[0] * expected_forces[:, 0] + alpha[1] * expected_forces[:, 1] + alpha[2] * expected_forces[:, 2]) + alpha[3]
     lincomb2 = (alpha[0+4] * expected_forces[:, 0] + alpha[1+4] * expected_forces[:, 1] + alpha[2+4] * expected_forces[:, 2]) + alpha[3+4]
     lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]
@@ -775,10 +815,12 @@ def linear_transformation_3d(alpha):
 
 def out_linear_transformation_3d(alpha):
 
+    global msg_most_imp
+    global expected_forces
+
     lincomb1 = (alpha[0] * expected_forces[:, 0] + alpha[1] * expected_forces[:, 1] + alpha[2] * expected_forces[:, 2]) + alpha[3]
     lincomb2 = (alpha[0+4] * expected_forces[:, 0] + alpha[1+4] * expected_forces[:, 1] + alpha[2+4] * expected_forces[:, 2]) + alpha[3+4]
-    lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]
-
+    lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]    
     return lincomb1, lincomb2, lincomb3
 
 
@@ -798,12 +840,7 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
     msg_comp_std = torch.std(msg_force_dict['edge_messages'], axis=0)  # Variance for each component
 
     # Step 3: Get top-3 indices based on variance
-    top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance
-
-    # Output the results of top-3 components
-    #print("Top-3 components with maximum STD are: ", top_std_indices)
-    #print("std values: ", msg_comp_std[top_std_indices])
-    
+    top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance  
 
     # Prepare data for linear regression using top-3 components as output variables
     msg_most_imp = msg_force_dict['edge_messages'][:, top_std_indices]  # Select only the top-3 components
@@ -811,23 +848,50 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
     
     # normalize the messages
     msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
+    '''
     expected_forces = msg_force_dict['force_gt'].cpu()
 
+    
     dim = 3
     min_result = minimize(linear_transformation_3d, np.ones(dim**2 + dim), method='Powell')
 
+    
     # Visualize the fit
     for i in range(dim):
         px = out_linear_transformation_3d(min_result.x)[i]
         py = msg_most_imp[:, i]
-        plt.plot(px, py)
+        plt.scatter(px, py)
         plt.show()
-
+    '''
     are_correlated = False
-    return are_correlated
+    return are_correlated, msg_most_imp
 
 
 
+################################################## Do, symbolic regression if linearity exists #########################################
+def regress_force_equation(msg_most_imp, msg_force_dict):   
+    from pysr import PySRRegressor
+
+    model = PySRRegressor(
+        niterations=1000,  # < Increase me for better results
+        binary_operators=["+", "*", "-", "/", "pow"],
+        unary_operators=[
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+        # ^ Custom loss function (julia syntax)
+    )
+    X = msg_force_dict['radial_distance'].cpu()
+    X = X.view(X.shape[0], 1)
+    y = msg_most_imp.sum(dim=1).cpu() # predict sum of message components as a function of radial distance
+    print(X.shape)
+    print(y.shape)
+
+    model.fit(X, y)    
+    print(model)
 
 
 
@@ -838,5 +902,5 @@ gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
-
-print("Result: ", are_edge_msgs_gt_force_correlated(msg_force_dict))
+are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
+regress_force_equation(msg_most_imp, msg_force_dict)
