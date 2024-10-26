@@ -884,16 +884,43 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
         elementwise_loss="loss(prediction, target) = (prediction - target)^2",
         # ^ Custom loss function (julia syntax)
     )
+    '''
+    Message component sum vs radial distance
+    '''
     X = msg_force_dict['radial_distance'].cpu()
     X = X.view(X.shape[0], 1)
-    y = msg_most_imp.sum(dim=1).cpu() # predict sum of message components as a function of radial distance
-    print(X.shape)
-    print(y.shape)
+    y1 = msg_most_imp.sum(dim=1).cpu() # predict sum of message components as a function of radial distance
 
-    model.fit(X, y)    
+    #model.fit(X, y)    
+    #print(model)
+
+
+    '''
+    LJ force vs radial distance
+    '''
+    y2 = msg_force_dict['force_gt'].cpu()[:, 0]
+
+
+
+    # Create a 1x2 subplot layout
+    plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
+    plt.scatter(X, y1, color='red')
+    plt.title('Message component sum vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('Message component sum')
+
+    plt.subplot(1, 2, 2)  # 1 row, 2 columns, second subplot
+    plt.scatter(X, y2, color='blue')
+    plt.title('LJ force vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('LJ force')
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+    #plt.show()
+
+    model.fit(X, y2)    
     print(model)
-
-
 
 
 
