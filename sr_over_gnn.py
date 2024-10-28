@@ -635,7 +635,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     rotation_aug = False # online rotation augmentation for a frame    
     # create train data-loader
     return_train_data = True
-    num_input_files = 1#len(os.listdir(md_filedir))
+    num_input_files = 1# 40#len(os.listdir(md_filedir))
     batch_size = num_input_files # number of graphs in a batch
     print("Loading input files: ", num_input_files)
     #print("Files are: ", os.listdir(md_filedir))
@@ -718,11 +718,12 @@ def compute_lj_force(pos, edge_index_list):
     
     nan_mask = torch.isnan(force_vector).any(dim=1)
     valid_indices = ~nan_mask    
-    
-    # Filter tensor_a using the mask
-    #valid_indices = valid_indices & same_index_columns
 
-    return force_vector, r, valid_indices
+    dx = r_vec[:, 0]
+    dy = r_vec[:, 1]
+    dz = r_vec[:, 2]
+    
+    return force_vector, r, valid_indices, dx, dy, dz
 
 
 
@@ -746,7 +747,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             evaluate(force_gt, force_pred_official)
             
             # record messages for SR
-            lj_force, radial_distance, valid_indices = compute_lj_force(pos, edge_index_list)                                 
+            lj_force, radial_distance, valid_indices, dx, dy, dz = compute_lj_force(pos, edge_index_list)                                 
 
             
             # remove nans
@@ -771,6 +772,9 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             msg_force_dict['edge_messages'] = msg_force_dict['edge_messages'][non_zero_rows_mask]                                  
             msg_force_dict['force_gt'] = lj_force # [num_particle * batch_size, 3]
             msg_force_dict['radial_distance'] = msg_force_dict['radial_distance'][non_zero_rows_mask]
+            msg_force_dict['dx'] = dx[valid_indices][non_zero_rows_mask]  
+            msg_force_dict['dy'] = dy[valid_indices][non_zero_rows_mask]
+            msg_force_dict['dz'] = dz[valid_indices][non_zero_rows_mask]
             
 
         break # run dataloader only once
@@ -847,7 +851,7 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
 
     
     # normalize the messages
-    msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
+    #msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
     '''
     expected_forces = msg_force_dict['force_gt'].cpu()
 
@@ -870,62 +874,89 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
 
 ################################################## Do, symbolic regression if linearity exists #########################################
 def regress_force_equation(msg_most_imp, msg_force_dict):   
+    
+    import matplotlib.tri as mtri
+    import pandas as pd
     from pysr import PySRRegressor
 
+    dx = msg_force_dict['dx'].cpu()
+    dy = msg_force_dict['dy'].cpu()
+    dz = msg_force_dict['dz'].cpu()
+    r = msg_force_dict['radial_distance'].cpu()
+    
+    z1 = msg_most_imp[:, 0].cpu()
+    z2 = msg_force_dict['force_gt'][:, 0].cpu()
+    
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'dx': dx.squeeze(),
+        'dy': dy.squeeze(),
+        'dz': dz.squeeze(),
+        'r': r.squeeze(),
+        'z1': z1.squeeze()
+    })
+    
+    # Define the features and target variable
+    X = data[['dx', 'dy', 'dz', 'r']].values
+    y = data['z1'].values
+    
+    # Initialize the PySR regressor
     model = PySRRegressor(
-        niterations=1000,  # < Increase me for better results
-        binary_operators=["+", "*", "-", "/", "pow"],
-        unary_operators=[
-            "inv(x) = 1/x",
-            # ^ Custom operator (julia syntax)
-        ],
-        extra_sympy_mappings={"inv": lambda x: 1 / x},
-        # ^ Define operator for SymPy as well
-        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-        # ^ Custom loss function (julia syntax)
+        niterations=1000,  # Number of iterations for optimization
+        binary_operators=['+', '-', '*', '/'],  # Operators to use
+        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
+        # Add more parameters as needed
     )
+    
+    # Fit the model to the data
+    model.fit(X, y)
+    
+    # Get the best equation found by PySR
+    best_equation = model.get_best()
+    
+    print("Best equation for z1 as a function of dx, dy, dz, and r:")
+    print(best_equation)    
     '''
-    Message component sum vs radial distance
+
+    # Create a figure for multiple surfaces
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Loop through different values of dz
+    unique_dzs = torch.unique(dz)
+    for k in unique_dzs[:3]:       
+        
+        # Get boolean mask where T's value is equal to K
+        mask = (dz == k)
+        # Count the number of rows in T with value equal to K
+        count_k = mask.sum().item()  # Convert tensor to Python integer
+        print("Count of rows in T with value =", k, ":", count_k)
+        
+        
+        dx1 = dx[mask]
+        dy1 = dy[mask]
+        z11 = z1[mask]
+        print("CHECK: ", dx1.shape, dy1.shape)
+        #ax.plot_surface(dx1, dy1, z11, alpha=0.5, label=f'dz={k}')  # Set alpha for transparency
+        # Create a Delaunay triangulation of the (x, y) points
+        triang = mtri.Triangulation(dx1, dy1)
+        # Plot the surface using the triangulation
+        ax.plot_trisurf(triang, z11, cmap='viridis', alpha=0.5, label=f'K={k}')
+    
+    # Add labels and title
+    ax.set_xlabel('X Axis')
+    ax.set_ylabel('Y Axis')
+    ax.set_zlabel('Z Axis')
+    ax.set_title('3D Surface Plots of Message component-1 for Different Values of dz')
+    
+    # Show the plot
+    plt.show()
     '''
-    X = msg_force_dict['radial_distance'].cpu()
-    X = X.view(X.shape[0], 1)
-    y1 = msg_most_imp.sum(dim=1).cpu() # predict sum of message components as a function of radial distance
-
-    #model.fit(X, y)    
-    #print(model)
-
-
-    '''
-    LJ force vs radial distance
-    '''
-    y2 = msg_force_dict['force_gt'].cpu()[:, 0]
-
-
-
-    # Create a 1x2 subplot layout
-    plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
-    plt.scatter(X, y1, color='red')
-    plt.title('Message component sum vs radial distance')
-    plt.xlabel('radial distance')
-    plt.ylabel('Message component sum')
-
-    plt.subplot(1, 2, 2)  # 1 row, 2 columns, second subplot
-    plt.scatter(X, y2, color='blue')
-    plt.title('LJ force vs radial distance')
-    plt.xlabel('radial distance')
-    plt.ylabel('LJ force')
-
-    # Adjust layout to prevent overlap
-    plt.tight_layout()
-    #plt.show()
-
-    model.fit(X, y2)    
-    print(model)
-
 
 
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
-gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
+gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
