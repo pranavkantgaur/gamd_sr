@@ -238,7 +238,7 @@ class ParticleNetLightning(pl.LightningModule):
         elif self.loss_fn == 'l1_message':
             regularization = 1e-2
             m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
-            normalized_l05 = torch.sum(torch.abs(m12))
+            normalized_l05 = torch.mean(torch.abs(m12))
             mae = nn.L1Loss()(pred, gt)            
             #message_regularization = regularization * self.batch_size * normalized_l05 / NUM_OF_ATOMS**2 * NUM_OF_ATOMS
             message_regularization_term = regularization * normalized_l05
@@ -246,8 +246,8 @@ class ParticleNetLightning(pl.LightningModule):
         else:
             loss = nn.MSELoss()(pred, gt)
 
-        conservative_loss = (torch.mean(pred)).abs()
-        loss = loss + LAMBDA2 * conservative_loss
+        #conservative_loss = (torch.mean(pred)).abs()
+        #loss = loss + LAMBDA2 * conservative_loss
 
         self.training_mean = self.train_data_scaler.mean_
         self.training_var = self.train_data_scaler.var_
