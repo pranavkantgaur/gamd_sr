@@ -13,19 +13,18 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 import jax
 import jax.numpy as jnp
 import cupy
-from torch_geometric.nn import summary
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 from nn_module import SimpleMDNetNew
 from train_utils import LJDataNew
 from graph_utils import NeighborSearcher, graph_network_nbr_fn
 import time
-import random
-
 # os.environ["CUDA_VISIBLE_DEVICES"] = "" # just to test if it works w/o gpu
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # for water box
-CUTOFF_RADIUS = 7.5
+#CUTOFF_RADIUS = 7.5
+CUTOFF_RADIUS = 10.2
 BOX_SIZE = 27.27
 
 NUM_OF_ATOMS = 258
@@ -36,17 +35,6 @@ NUM_OF_ATOMS = 258
 LAMBDA1 = 100.
 LAMBDA2 = 1e-3
 
-# Set the seed
-seed = 10
-
-# PyTorch seed
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-# Python random seed
-random.seed(seed)
 
 def get_rotation_matrix():
     """ Randomly rotate the point clouds to augument the dataset
@@ -105,7 +93,6 @@ class ParticleNetLightning(pl.LightningModule):
     def __init__(self, args, num_device=1, epoch_num=100, batch_size=1, learning_rate=3e-4, log_freq=1000,
                  model_weights_ckpt=None, scaler_ckpt=None):
         super(ParticleNetLightning, self).__init__()
-        self.automatic_optimization = False
         self.pnet_model = build_model(args, model_weights_ckpt)
         self.epoch_num = epoch_num
         self.learning_rate = learning_rate
@@ -113,7 +100,6 @@ class ParticleNetLightning(pl.LightningModule):
         self.num_device = num_device
         self.log_freq = log_freq
         self.train_data_scaler = StandardScaler()
-        self.val_data_scaler = StandardScaler()
         self.training_mean = np.array([0.])
         self.training_var = np.array([1.])
 
@@ -129,7 +115,7 @@ class ParticleNetLightning(pl.LightningModule):
         self.rotate_aug = args.rotate_aug
         self.data_dir = args.data_dir
         self.loss_fn = args.loss
-        assert self.loss_fn in ['mae', 'mse']
+        assert self.loss_fn in ['mae', 'mse', 'l1_message']
 
     def load_training_stats(self, scaler_ckpt):
         if scaler_ckpt is not None:
@@ -180,9 +166,9 @@ class ParticleNetLightning(pl.LightningModule):
 
     def get_edge_idx(self, nbrs, pos_jax, mask):
         dummy_center_idx = nbrs.idx.copy()
-        #Instead of ops.index_update(x, idx, vals) you should use x.at[idx].set(vals).
+        #dummy_center_idx = jax.ops.index_update(dummy_center_idx, None,
+        #                                        jnp.arange(pos_jax.shape[0]).reshape(-1, 1))
         dummy_center_idx = dummy_center_idx.at[:].set(jnp.arange(pos_jax.shape[0]).reshape(-1, 1))
-        #jax.ops.index_update(dummy_center_idx, None, jnp.arange(pos_jax.shape[0]).reshape(-1, 1))
         center_idx = dummy_center_idx.reshape(-1)
         center_idx_ = cupy.asarray(center_idx)
         center_idx_tsr = torch.as_tensor(center_idx_, device='cuda')
@@ -200,7 +186,7 @@ class ParticleNetLightning(pl.LightningModule):
                                  dim=0)
         return edge_idx_tsr
 
-    def search_for_neighbor(self, pos, nbr_searcher, masking_fn, type_name):        
+    def search_for_neighbor(self, pos, nbr_searcher, masking_fn, type_name):
         pos_jax = jax.device_put(pos, jax.devices("gpu")[0])
 
         if not nbr_searcher.has_been_init:
@@ -211,18 +197,16 @@ class ParticleNetLightning(pl.LightningModule):
             self.nbr_cache[type_name] = nbrs
 
         edge_mask_all = masking_fn(pos_jax, nbrs.idx)
-        
         edge_idx_tsr = self.get_edge_idx(nbrs, pos_jax, edge_mask_all)
         return edge_idx_tsr.long()
 
-    def training_step(self, batch, batch_nb):   
+    def training_step(self, batch, batch_nb):
         pos_lst = batch['pos']
         gt_lst = batch['forces']
         edge_idx_lst = []
         for b in range(len(gt_lst)):
             pos, gt = pos_lst[b], gt_lst[b]
 
-            # TODO-12: whether rot aug matters? NO
             if self.rotate_aug:
                 pos = np.mod(pos, BOX_SIZE)
                 pos, off = center_positions(pos)
@@ -232,88 +216,48 @@ class ParticleNetLightning(pl.LightningModule):
                 gt = np.matmul(gt, R)
 
             pos = np.mod(pos, BOX_SIZE)
-            # TODO-14: Does force scaling matter? Slows down convergence
-            #print("Before scale: ", gt[0])
+
             gt = self.scale_force(gt, self.train_data_scaler).cuda()
-            #print("After scale: ", gt[0])
             pos_lst[b] = torch.from_numpy(pos).float().cuda()
             gt_lst[b] = gt
-            #if b==0:
-            #    print("GT is this: ", gt[0]) 
-            #    print("pos is this: ", pos[0])           
+
             edge_idx_tsr = self.search_for_neighbor(pos,
                                                     self.nbr_searcher,
                                                     self.nbrlst_to_edge_mask,
                                                     'all')
             edge_idx_lst += [edge_idx_tsr]
-        
         gt = torch.cat(gt_lst, dim=0)
-        # TODO-13: Whether random jittering of particle positions matter? Not much
-        #pos_lst = [pos + torch.randn_like(pos) * 0.005 for pos in pos_lst]        
+        pos_lst = [pos + torch.randn_like(pos) * 0.005 for pos in pos_lst]
+
         pred = self.pnet_model(pos_lst,
                                edge_idx_lst,
                                )
 
-
-        #from torch_geometric.nn import summary
-        # Print the model summary
-        #print(summary(self.pnet_model, pos_lst, edge_idx_lst, max_depth=10))  
-
         if self.loss_fn == 'mae':
             loss = nn.L1Loss()(pred, gt)
-            #print("prediction: ", pred[150])
-            #print("GT: ", gt[150])            
-            print("LOSS VALUE: ", loss.item())                        
-            #exit(0)
+        elif self.loss_fn == 'l1_message':
+            regularization = 1e-2
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            normalized_l05 = torch.sum(torch.abs(m12))
+            mae = nn.L1Loss()(pred, gt)            
+            #message_regularization = regularization * self.batch_size * normalized_l05 / NUM_OF_ATOMS**2 * NUM_OF_ATOMS
+            message_regularization_term = regularization * normalized_l05
+            loss = mae + message_regularization_term             
         else:
             loss = nn.MSELoss()(pred, gt)
 
-        #conservative_loss = (torch.mean(pred)).abs()
-        #loss = loss + LAMBDA2 * conservative_loss
+        conservative_loss = (torch.mean(pred)).abs()
+        loss = loss + LAMBDA2 * conservative_loss
 
-        #loss.backward()
-
-        
-        opt = self.optimizers(use_pl_optimizer=True)
-        self.manual_backward(loss)
-        opt.step()
-        opt.zero_grad()
-        #for name, param in self.named_parameters():
-        #    if 'graph_decoder' in name:
-        #        print(f'Gradient for {name}: {param.grad}')
-        #exit(0)        
-        '''
-        if self._fabric:
-            print("Fabric")
-            self._fabric.backward(loss, *args, **kwargs)
-
-        else:
-            print("Verfify manual opt")
-            self._verify_is_manual_optimization("manual_backward")
-            print("")
-            #self.trainer.strategy.backward(loss, None, *args, **kwargs)
-        '''
-        
-        '''
-        #loss.backward()
-        for name, param in self.named_parameters():
-            if 'graph_decoder' in name:
-                print(f'Gradient for {name}: {param.grad}')        
-        exit(0)
-        opt.step()
-        opt.zero_grad()
-        
         self.training_mean = self.train_data_scaler.mean_
         self.training_var = self.train_data_scaler.var_
-        batch_size = len(gt_lst)
-        self.log('total loss', loss, on_step=True, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log(f'{self.loss_fn} loss', loss, on_step=True, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log('var', torch.tensor(np.sqrt(self.training_var)), on_step=True, prog_bar=True, logger=True, batch_size=batch_size)
-        
+
+        self.log('total loss', loss, on_step=True, prog_bar=True, logger=True)
+        self.log(f'{self.loss_fn} loss', loss, on_step=True, prog_bar=True, logger=True)
+        self.log('var', torch.tensor(np.sqrt(self.training_var)), on_step=True, prog_bar=True, logger=True)
+
         return loss
-        '''
-     
-    
+
     def configure_optimizers(self):
         optim = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         sched = StepLR(optim, step_size=5, gamma=0.001**(5/self.epoch_num))
@@ -325,8 +269,8 @@ class ParticleNetLightning(pl.LightningModule):
                                case_prefix='ljdata_',
                                seed_num=10,
                                mode='train')
-        print("Data loader batch size: ", self.batch_size)
-        return DataLoader(dataset, num_workers=0, batch_size=self.batch_size, shuffle=True,
+
+        return DataLoader(dataset, num_workers=2, batch_size=self.batch_size, shuffle=True,
                           collate_fn=
                           lambda batches: {
                               'pos': [batch['pos'] for batch in batches],
@@ -349,16 +293,15 @@ class ParticleNetLightning(pl.LightningModule):
 
     def validation_step(self, batch, batch_nb):
         with torch.no_grad():
-            
+
             pos_lst = batch['pos']
-            '''
             gt_lst = batch['forces']
             edge_idx_lst = []
             for b in range(len(gt_lst)):
                 pos, gt = pos_lst[b], gt_lst[b]
                 pos = np.mod(pos, BOX_SIZE)
 
-                gt = self.scale_force(gt, self.val_data_scaler).cuda()
+                gt = self.scale_force(gt, self.train_data_scaler).cuda()
                 pos_lst[b] = torch.from_numpy(pos).float().cuda()
                 gt_lst[b] = gt
 
@@ -367,24 +310,21 @@ class ParticleNetLightning(pl.LightningModule):
                                                         self.nbrlst_to_edge_mask,
                                                         'all')
                 edge_idx_lst += [edge_idx_tsr]
-            # Assuming you want to move everything to cuda:0
-            #gt_lst = [tensor.to('cuda:0') for tensor in gt_lst]  # Move all tensors to cuda:0
             gt = torch.cat(gt_lst, dim=0)
-            
+
             pred = self.pnet_model(pos_lst,
                                    edge_idx_lst,
                                    )
-            
-            
             ratio = torch.sqrt((pred.reshape(-1) - gt.reshape(-1)) ** 2) / (torch.abs(pred.reshape(-1)) + 1e-8)
             outlier_ratio = ratio[ratio > 10.].shape[0] / ratio.shape[0]
             mse = nn.MSELoss()(pred, gt)
             mae = nn.L1Loss()(pred, gt)
+
             batch_size = len(gt_lst)
             self.log('val outlier', outlier_ratio, prog_bar=True, logger=True, batch_size = batch_size)
             self.log('val mse', mse, prog_bar=True, logger=True, batch_size = batch_size)
             self.log('val mae', mae, prog_bar=True, logger=True, batch_size = batch_size)
-            '''
+
 
 class ModelCheckpointAtEpochEnd(pl.Callback):
     """
@@ -407,7 +347,7 @@ class ModelCheckpointAtEpochEnd(pl.Callback):
 
     def on_epoch_end(self, trainer: pl.Trainer, pl_module: ParticleNetLightning):
         """ Check if we should save a checkpoint after every train batch """
-        epoch = trainer.current_epoch
+        epoch = trainer.current_epoch        
         if epoch % self.save_step_frequency == 0 or epoch == pl_module.epoch_num -1:
             filename = os.path.join(self.filepath, f"{self.prefix}_{epoch}.ckpt")
             scaler_filename = os.path.join(self.filepath, f"scaler_{epoch}.npz")
@@ -429,6 +369,7 @@ def train_model(args):
     max_epoch = args.max_epoch
     weight_ckpt = args.state_ckpt_dir
     batch_size = args.batch_size
+
     model = ParticleNetLightning(epoch_num=max_epoch,
                                  num_device=num_gpu if num_gpu != -1 else 1,
                                  learning_rate=lr,
@@ -438,11 +379,10 @@ def train_model(args):
     cwd = os.getcwd()
     model_check_point_dir = os.path.join(cwd, check_point_dir)
     os.makedirs(model_check_point_dir, exist_ok=True)
-    epoch_end_callback = ModelCheckpointAtEpochEnd(filepath=model_check_point_dir, save_step_frequency=5)
+    print("Checkpoints will be saved at: ", model_check_point_dir)
+    epoch_end_callback = ModelCheckpointAtEpochEnd(filepath=model_check_point_dir, save_step_frequency=1)
     checkpoint_callback = pl.callbacks.ModelCheckpoint()
 
-
-    '''
     trainer = Trainer(
         devices=num_gpu,  # Use 'devices' instead of 'gpus'
         accelerator='gpu',  # Specify the accelerator as 'gpu'
@@ -452,9 +392,8 @@ def train_model(args):
         precision=16,  # Use 'precision' for mixed precision if needed
         benchmark=True,
         strategy='ddp',  # Use 'strategy' for distributed training
+        default_root_dir='/home/pranav/gamd_sr/official/GAMD-main/code/LJ/model_ckpt'
     )
-    '''
-    trainer = pl.Trainer(accelerator="gpu", devices=1)
     trainer.fit(model)
 
 
@@ -463,7 +402,7 @@ def main():
     parser.add_argument('--min_epoch', default=30, type=int)
     parser.add_argument('--max_epoch', default=30, type=int)
     parser.add_argument('--lr', default=3e-4, type=float)
-    parser.add_argument('--cp_dir', default='./model_ckpt')
+    parser.add_argument('--cp_dir', default='model_ckpt')
     parser.add_argument('--state_ckpt_dir', default=None, type=str)
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--encoding_size', default=256, type=int)
