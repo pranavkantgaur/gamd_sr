@@ -19,7 +19,7 @@ from nn_module import SimpleMDNetNew
 from train_utils import LJDataNew
 from graph_utils import NeighborSearcher, graph_network_nbr_fn
 import time
-# os.environ["CUDA_VISIBLE_DEVICES"] = "" # just to test if it works w/o gpu
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1" # just to test if it works w/o gpu
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # for water box
@@ -115,7 +115,7 @@ class ParticleNetLightning(pl.LightningModule):
         self.rotate_aug = args.rotate_aug
         self.data_dir = args.data_dir
         self.loss_fn = args.loss
-        assert self.loss_fn in ['mae', 'mse', 'l1_message']
+        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message']
 
     def load_training_stats(self, scaler_ckpt):
         if scaler_ckpt is not None:
@@ -243,6 +243,14 @@ class ParticleNetLightning(pl.LightningModule):
             #message_regularization = regularization * self.batch_size * normalized_l05 / NUM_OF_ATOMS**2 * NUM_OF_ATOMS
             message_regularization_term = regularization * normalized_l05
             loss = mae + message_regularization_term             
+        elif self.loss_fn == 'kl_message':
+            mae = nn.L1Loss()(pred, gt)            
+            raw_msg = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            mu = raw_msg[:, 0::2]
+            logvar = raw_msg[:, 1::2]
+            full_kl = torch.mean(torch.exp(logvar) + mu**2 - logvar)/2.0
+            loss = mae + full_kl
+
         else:
             loss = nn.MSELoss()(pred, gt)
 
@@ -384,7 +392,7 @@ def train_model(args):
     checkpoint_callback = pl.callbacks.ModelCheckpoint()
 
     trainer = Trainer(
-        devices=num_gpu,  # Use 'devices' instead of 'gpus'
+        devices=[1],#num_gpu,  # Use 'devices' instead of 'gpus'
         accelerator='gpu',  # Specify the accelerator as 'gpu'
         callbacks=[epoch_end_callback, checkpoint_callback],
         min_epochs=min_epoch,
