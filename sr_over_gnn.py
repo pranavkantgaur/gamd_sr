@@ -893,7 +893,8 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
         'dy': dy.squeeze(),
         'dz': dz.squeeze(),
         'r': r.squeeze(),
-        'z1': z1.squeeze()
+        'z1': z1.squeeze(),
+        'z2': z2.squeeze()        
     })
     
     # Define the features and target variable
@@ -915,7 +916,29 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     best_equation = model.get_best()
     
     print("Best equation for z1 as a function of dx, dy, dz, and r:")
-    print(best_equation)    
+    print(best_equation)
+    
+    
+    print("Fitting LJ force now....")
+    
+    # Initialize the PySR regressor
+    model = PySRRegressor(
+        niterations=1000,  # Number of iterations for optimization
+        binary_operators=['+', '-', '*', '/'],  # Operators to use
+        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
+        # Add more parameters as needed
+    )
+    
+    y = data['z2'].values
+    # Fit the model to the data
+    model.fit(X, y)
+    
+    # Get the best equation found by PySR
+    best_equation = model.get_best()
+    
+    print("Best equation for z2 as a function of dx, dy, dz, and r:")
+    print(best_equation)      
+        
     '''
 
     # Create a figure for multiple surfaces
@@ -954,11 +977,31 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     '''
 
 
+def plot_message_sparsity(msg_force_dict):
+    msg_array = msg_force_dict['edge_messages'].cpu()
+    msg_importance = msg_array.std(axis=0)        
+    
+    top_std_indices = torch.argsort(msg_importance)[-15:]
+    top_importance_values = msg_importance[top_std_indices].numpy()
+    print("Message sparsity: ", top_importance_values)
+    fig, ax = plt.subplots(1, 1)
+    ax.pcolormesh(top_importance_values[None, ], cmap='gray_r', edgecolors='k')
+    plt.axis('off')
+    plt.grid(True)
+    ax.set_aspect('equal')
+    plt.text(15.5, 0.5, '...', fontsize=30)
+    plt.tight_layout()    
+    plt.show()
+    
+
+
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 #gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
-gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
+gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
-are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
-regress_force_equation(msg_most_imp, msg_force_dict)
+#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
+#regress_force_equation(msg_most_imp, msg_force_dict)
+plot_message_sparsity(msg_force_dict)
