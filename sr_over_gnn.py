@@ -680,7 +680,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
     return None, gamdnet_official, dataloader
 
 
-def compute_lj_force(pos, edge_index_list):
+def compute_lj_force_and_potential(pos, edge_index_list):
     
  
     # Find columns where both rows have the same index
@@ -932,7 +932,7 @@ def are_edge_msgs_gt_potential_correlated(msg_force_dict):
     # normalize the messages
     #msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
     
-    expected_forces = msg_force_dict['potential_gt'].cpu()
+    expected_potentials = msg_force_dict['potential_gt'].cpu()
 
     
     dim = 3
@@ -949,6 +949,80 @@ def are_edge_msgs_gt_potential_correlated(msg_force_dict):
     
     are_correlated = False
     return are_correlated, msg_most_imp
+
+
+
+
+def plot_lj_force_vs_rad_dist_with_messages(msg_force_dict):
+    edge_messages = msg_force_dict['edge_messages'].cpu()
+    lj_force = msg_force_dict['force_gt'].cpu()
+    r = msg_force_dict['radial_distance'].cpu()
+
+    lj_force_std = torch.std(lj_force, dim=0)    
+    lj_force_comp1_index = torch.argsort(lj_force_std)[-1] # most imp. last
+    lj_force_comp_1 = lj_force[:, lj_force_comp1_index]
+    
+    edge_msg_comp_std = torch.std(edge_messages, dim=0)    
+    edge_msg_comp1_index = torch.argsort(edge_msg_comp_std)[-1] # most imp. last
+    msg_comp_1 = edge_messages[:, edge_msg_comp1_index]
+
+    # Create first subplot
+    plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
+    plt.scatter(r, lj_force_comp_1, color='red', alpha=0.6) 
+    plt.title('LJ force comp-1 vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('LJ force comp-1')
+
+    # Create second subplot
+    plt.subplot(1, 2, 2)  # 1 row, 2 columns, second subplot
+    plt.scatter(r, msg_comp_1, color='blue', alpha=0.6)
+    plt.title('Edge msg comp-1 vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('edge msg. comp-1')
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+
+    # Show the plots
+    plt.show()
+
+
+
+
+def plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict):
+    edge_messages = msg_force_dict['edge_messages'].cpu()
+    lj_potential = msg_force_dict['potential_gt'].cpu()
+    r = msg_force_dict['radial_distance'].cpu()
+
+    lj_potential_std = torch.std(lj_potential, dim=0)    
+    lj_potential_comp1_index = torch.argsort(lj_potential_std)[-1] # most imp. last
+    lj_potential_comp_1 = lj_potential[:, lj_potential_comp1_index]
+    
+    edge_msg_comp_std = torch.std(edge_messages, dim=0)    
+    edge_msg_comp1_index = torch.argsort(edge_msg_comp_std)[-1] # most imp. last
+    msg_comp_1 = edge_messages[:, edge_msg_comp1_index]
+
+    # Create first subplot
+    plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
+    plt.scatter(r, lj_potential_comp_1, color='red', alpha=0.6)
+    plt.title('LJ potential comp-1 vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('LJ potential comp-1')
+
+    # Create second subplot
+    plt.subplot(1, 2, 2)  # 1 row, 2 columns, second subplot
+    plt.scatter(r, msg_comp_1, color='blue', alpha=0.6)
+    plt.title('Edge msg comp-1 vs radial distance')
+    plt.xlabel('radial distance')
+    plt.ylabel('edge msg. comp-1')
+
+    # Adjust layout to prevent overlap
+    plt.tight_layout()
+
+    # Show the plots
+    plt.show()
+
+
 
 ################################################## Do, symbolic regression if linearity exists #########################################
 def regress_force_equation(msg_most_imp, msg_force_dict):   
@@ -1114,5 +1188,10 @@ msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 #are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
 #regress_force_equation(msg_most_imp, msg_force_dict)
 #plot_message_sparsity(msg_force_dict)
-lj_potentials = get_LJ_potentials(pos, edge_index_list)
-are_edge_msgs_gt_potential_correlated(lj_potentials, msg_force_dict)
+#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
+#print("Checking potentials now....")
+#are_edge_msgs_gt_potential_correlated(msg_force_dict)
+
+
+plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
+plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
