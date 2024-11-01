@@ -714,8 +714,13 @@ def compute_lj_force(pos, edge_index_list):
     )  # Shape: [n, 1]
 
     # Calculate the force vector (directed)
-    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]     
+    force_vector = force_magnitude * (r_vec / r)  # Shape: [n, 3]
     
+
+    potential_magnitude = 4 * epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
+
+    potential_vector = potential_magnitude * (r_vec / r)
+
     nan_mask = torch.isnan(force_vector).any(dim=1)
     valid_indices = ~nan_mask    
 
@@ -723,7 +728,7 @@ def compute_lj_force(pos, edge_index_list):
     dy = r_vec[:, 1]
     dz = r_vec[:, 2]
     
-    return force_vector, r, valid_indices, dx, dy, dz
+    return force_vector, potential_vector, r, valid_indices, dx, dy, dz
 
 
 
@@ -747,7 +752,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             evaluate(force_gt, force_pred_official)
             
             # record messages for SR
-            lj_force, radial_distance, valid_indices, dx, dy, dz = compute_lj_force(pos, edge_index_list)                                 
+            lj_force, lj_potential, radial_distance, valid_indices, dx, dy, dz = compute_lj_force_and_potential(pos, edge_index_list)                                 
 
             
             # remove nans
@@ -775,6 +780,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             msg_force_dict['dx'] = dx[valid_indices][non_zero_rows_mask]  
             msg_force_dict['dy'] = dy[valid_indices][non_zero_rows_mask]
             msg_force_dict['dz'] = dz[valid_indices][non_zero_rows_mask]
+            msg_force_dict['potential_gt'] = lj_potential[valid_indices][non_zero_rows_mask]
             
 
         break # run dataloader only once
@@ -789,6 +795,7 @@ from scipy.optimize import minimize
 
 msg_most_imp = None
 expected_forces = None
+expected_potentials = None
 
 def percentile_sum(x):
     x = x.ravel()
@@ -799,7 +806,7 @@ def percentile_sum(x):
     return x[msk].sum()/frac_good
 
 
-def linear_transformation_3d(alpha):
+def linear_transformation_3d_force(alpha):
 
     global msg_most_imp
     global expected_forces
@@ -817,7 +824,7 @@ def linear_transformation_3d(alpha):
     return score
 
 
-def out_linear_transformation_3d(alpha):
+def out_linear_transformation_3d_force(alpha):
 
     global msg_most_imp
     global expected_forces
@@ -827,6 +834,35 @@ def out_linear_transformation_3d(alpha):
     lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]    
     return lincomb1, lincomb2, lincomb3
 
+
+def linear_transformation_3d_potential(alpha):
+
+    global msg_most_imp
+    global expected_potentials
+    
+    lincomb1 = (alpha[0] * expected_potentials[:, 0] + alpha[1] * expected_potentials[:, 1] + alpha[2] * expected_potentials[:, 2]) + alpha[3]
+    lincomb2 = (alpha[0+4] * expected_potentials[:, 0] + alpha[1+4] * expected_potentials[:, 1] + alpha[2+4] * expected_potentials[:, 2]) + alpha[3+4]
+    lincomb3 = (alpha[0+8] * expected_potentials[:, 0] + alpha[1+8] * expected_potentials[:, 1] + alpha[2+8] * expected_potentials[:, 2]) + alpha[3+8]
+
+    score = (
+        percentile_sum(np.square(msg_most_imp[:, 0] - lincomb1)) +
+        percentile_sum(np.square(msg_most_imp[:, 1] - lincomb2)) +
+        percentile_sum(np.square(msg_most_imp[:, 2] - lincomb3))
+    )/3.0
+
+    return score
+
+
+def out_linear_transformation_3d_potential(alpha):
+
+    global msg_most_imp
+    global expected_potentials
+
+    lincomb1 = (alpha[0] * expected_potentials[:, 0] + alpha[1] * expected_potentials[:, 1] + alpha[2] * expected_potentials[:, 2]) + alpha[3]
+    lincomb2 = (alpha[0+4] * expected_potentials[:, 0] + alpha[1+4] * expected_potentials[:, 1] + alpha[2+4] * expected_potentials[:, 2]) + alpha[3+4]
+    lincomb3 = (alpha[0+8] * expected_potentials[:, 0] + alpha[1+8] * expected_potentials[:, 1] + alpha[2+8] * expected_potentials[:, 2]) + alpha[3+8]
+    
+    return lincomb1, lincomb2, lincomb3
 
 
 
@@ -847,30 +883,72 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
     top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance  
 
     # Prepare data for linear regression using top-3 components as output variables
-    msg_most_imp = msg_force_dict['edge_messages'][:, top_std_indices]  # Select only the top-3 components
+    msg_most_imp = msg_force_dict['edge_messages'][:, top_std_indices].cpu()  # Select only the top-3 components
 
     
     # normalize the messages
     #msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
-    '''
+    
     expected_forces = msg_force_dict['force_gt'].cpu()
 
     
     dim = 3
-    min_result = minimize(linear_transformation_3d, np.ones(dim**2 + dim), method='Powell')
+    min_result = minimize(linear_transformation_3d_force, np.ones(dim**2 + dim), method='Powell')
 
-    
+    print("Fit score: ", min_result.fun/msg_force_dict['edge_messages'].shape[0])
+
     # Visualize the fit
     for i in range(dim):
-        px = out_linear_transformation_3d(min_result.x)[i]
+        px = out_linear_transformation_3d_force(min_result.x)[i]
         py = msg_most_imp[:, i]
         plt.scatter(px, py)
         plt.show()
-    '''
+    
     are_correlated = False
     return are_correlated, msg_most_imp
 
 
+
+def are_edge_msgs_gt_potential_correlated(msg_force_dict):
+    '''
+    msg_force_dict: {'edge_messages': [total_edges, emb_dim], 'gt_force': [total_edges, 3]}
+    '''
+    global msg_most_imp
+    global expected_potentials
+
+    print("edge message shape: ", msg_force_dict['edge_messages'].shape)
+    print("force shape: ", msg_force_dict['potential_gt'].shape)
+
+    # Calculate variance for each component of agg_msg across all samples
+    msg_comp_std = torch.std(msg_force_dict['edge_messages'], axis=0)  # Variance for each component
+
+    # Step 3: Get top-3 indices based on variance
+    top_std_indices = torch.argsort(msg_comp_std)[-3:]  # Get indices of top-3 components with maximum variance  
+
+    # Prepare data for linear regression using top-3 components as output variables
+    msg_most_imp = msg_force_dict['edge_messages'][:, top_std_indices].cpu()  # Select only the top-3 components
+
+    
+    # normalize the messages
+    #msg_most_imp = ((msg_most_imp - torch.mean(msg_most_imp, axis=0)) / torch.std(msg_most_imp, axis=0)).cpu()
+    
+    expected_forces = msg_force_dict['potential_gt'].cpu()
+
+    
+    dim = 3
+    min_result = minimize(linear_transformation_3d_potential, np.ones(dim**2 + dim), method='Powell')
+
+    print("Fit score: ", min_result.fun/msg_force_dict['edge_messages'].shape[0])
+
+    # Visualize the fit
+    for i in range(dim):
+        px = out_linear_transformation_3d_potential(min_result.x)[i]
+        py = msg_most_imp[:, i]
+        plt.scatter(px, py)
+        plt.show()
+    
+    are_correlated = False
+    return are_correlated, msg_most_imp
 
 ################################################## Do, symbolic regression if linearity exists #########################################
 def regress_force_equation(msg_most_imp, msg_force_dict):   
@@ -902,13 +980,28 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     y = data['z1'].values
     
     # Initialize the PySR regressor
+    '''
     model = PySRRegressor(
         niterations=1000,  # Number of iterations for optimization
         binary_operators=['+', '-', '*', '/'],  # Operators to use
         unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
         # Add more parameters as needed
     )
-    
+    '''
+    # Initialize the PySR regressor with adjusted operators
+    model = PySRRegressor(
+    niterations=1000,  # < Increase me for better results
+    binary_operators=["+", "*", "-", "/", "pow"],
+    unary_operators=[
+        "inv(x) = 1/x",
+        # ^ Custom operator (julia syntax)
+    ],
+    extra_sympy_mappings={"inv": lambda x: 1 / x},
+    # ^ Define operator for SymPy as well
+    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+    # ^ Custom loss function (julia syntax)
+    )
+  
     # Fit the model to the data
     model.fit(X, y)
     
@@ -920,7 +1013,7 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     
     
     print("Fitting LJ force now....")
-    
+    '''
     # Initialize the PySR regressor
     model = PySRRegressor(
         niterations=1000,  # Number of iterations for optimization
@@ -928,7 +1021,21 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
         unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
         # Add more parameters as needed
     )
-    
+    '''
+    # Initialize the PySR regressor with adjusted operators
+    model = PySRRegressor(
+    niterations=1000,  # < Increase me for better results
+    binary_operators=["+", "*", "-", "/", "pow"],
+    unary_operators=[
+        "inv(x) = 1/x",
+        # ^ Custom operator (julia syntax)
+    ],
+    extra_sympy_mappings={"inv": lambda x: 1 / x},
+    # ^ Define operator for SymPy as well
+    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+    # ^ Custom loss function (julia syntax)
+    )
+
     y = data['z2'].values
     # Fit the model to the data
     model.fit(X, y)
@@ -995,13 +1102,17 @@ def plot_message_sparsity(msg_force_dict):
     
 
 
+
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 #gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
-#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
-gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
+gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
+
 #are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
 #regress_force_equation(msg_most_imp, msg_force_dict)
-plot_message_sparsity(msg_force_dict)
+#plot_message_sparsity(msg_force_dict)
+lj_potentials = get_LJ_potentials(pos, edge_index_list)
+are_edge_msgs_gt_potential_correlated(lj_potentials, msg_force_dict)
