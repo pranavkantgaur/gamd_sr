@@ -961,10 +961,14 @@ def plot_lj_force_vs_rad_dist_with_messages(msg_force_dict):
     lj_force_std = torch.std(lj_force, dim=0)    
     lj_force_comp1_index = torch.argsort(lj_force_std)[-1] # most imp. last
     lj_force_comp_1 = lj_force[:, lj_force_comp1_index]
+    print("LJ force stds: ", lj_force_std[torch.argsort(lj_force_std)[-3:]])
+    print("LJ force means: ", torch.mean(lj_force, axis = 0)[torch.argsort(lj_force_std)[-3:]])
     
-    edge_msg_comp_std = torch.std(edge_messages, dim=0)    
-    edge_msg_comp1_index = torch.argsort(edge_msg_comp_std)[-1] # most imp. last
+    edge_msg_comp_std = torch.std(edge_messages, dim=0)        
+    edge_msg_comp1_index = torch.argsort(edge_msg_comp_std)[-1] # most imp. last    
     msg_comp_1 = edge_messages[:, edge_msg_comp1_index]
+    print("Edge message stds: ", edge_msg_comp_std[torch.argsort(edge_msg_comp_std)[-3:]])
+    print("Edge message means: ", torch.mean(edge_messages, axis = 0)[torch.argsort(edge_msg_comp_std)[-3:]])
 
     # Create first subplot
     plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
@@ -997,10 +1001,14 @@ def plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict):
     lj_potential_std = torch.std(lj_potential, dim=0)    
     lj_potential_comp1_index = torch.argsort(lj_potential_std)[-1] # most imp. last
     lj_potential_comp_1 = lj_potential[:, lj_potential_comp1_index]
-    
+    print("LJ potential stds: ", lj_potential_std[torch.argsort(lj_potential_std)[-3:]])
+    print("LJ potential means: ", torch.mean(lj_potential, axis = 0)[torch.argsort(lj_potential_std)[-3:]])
+
     edge_msg_comp_std = torch.std(edge_messages, dim=0)    
     edge_msg_comp1_index = torch.argsort(edge_msg_comp_std)[-1] # most imp. last
     msg_comp_1 = edge_messages[:, edge_msg_comp1_index]
+    print("Edge message stds: ", edge_msg_comp_std[torch.argsort(edge_msg_comp_std)[-3:]])
+    print("Edge message means: ", torch.mean(edge_messages, axis = 0)[torch.argsort(edge_msg_comp_std)[-3:]])
 
     # Create first subplot
     plt.subplot(1, 2, 1)  # 1 row, 2 columns, first subplot
@@ -1157,6 +1165,93 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     plt.show()
     '''
 
+def regress_potential_equation(msg_most_imp, msg_force_dict):   
+    
+    import matplotlib.tri as mtri
+    import pandas as pd
+    from pysr import PySRRegressor
+
+    dx = msg_force_dict['dx'].cpu()
+    dy = msg_force_dict['dy'].cpu()
+    dz = msg_force_dict['dz'].cpu()
+    r = msg_force_dict['radial_distance'].cpu()
+    
+    z1 = msg_most_imp[:, -1].cpu() # the one with highest std
+    potential_stds = torch.std(msg_force_dict['potential_gt'], axis=0)
+    potential_id = torch.argsort(potential_stds)[-1] # the one with highest std
+    print("Using potential component: ", potential_id)
+    z2 = msg_force_dict['potential_gt'][:, potential_id].cpu()
+    
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'dx': dx.squeeze(),
+        'dy': dy.squeeze(),
+        'dz': dz.squeeze(),
+        'r': r.squeeze(),
+        'z1': z1.squeeze(),
+        'z2': z2.squeeze()        
+    })
+    
+    # Define the features and target variable
+    X = data[['dx', 'dy', 'dz', 'r']].values
+    y = data['z1'].values
+    print("Fitting edge message comp-1 now....")
+    model = PySRRegressor(
+    niterations=1000,
+    model_selection="accuracy",
+    binary_operators=["-", "*", "/", "pow", "+"],        
+    unary_operators=[
+        "inv(x) = 1/x",
+        # ^ Custom operator (julia syntax)
+    ],      
+    extra_sympy_mappings={"inv": lambda x: 1 / x},
+    # ^ Define operator for SymPy as well
+    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+    # ^ Custom loss function (julia syntax)  
+    complexity_of_variables=2,
+    constraints={"pow": (-1, 1)},  
+    )
+  
+    # Fit the model to the data
+    model.fit(X, y)
+    
+    # Get the best equation found by PySR
+    best_equation = model.get_best()
+    
+    print("Best equation for edge message comp-1 as a function of dx, dy, dz, and r:")
+    print(best_equation)
+    
+    
+    print("Fitting LJ potential comp-1 now....")
+    # Initialize the PySR regressor with adjusted operators
+    model = PySRRegressor(
+    niterations=1000,
+    model_selection="accuracy",
+    binary_operators=["-", "*", "/", "pow", "+"],        
+    unary_operators=[
+        "inv(x) = 1/x",
+        # ^ Custom operator (julia syntax)
+    ],    
+    extra_sympy_mappings={"inv": lambda x: 1 / x},
+    # ^ Define operator for SymPy as well
+    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+    # ^ Custom loss function (julia syntax)    
+    complexity_of_variables=2,
+    constraints={"pow": (-1, 1)},    
+    )
+  
+
+    y = data['z2'].values
+    # Fit the model to the data
+    model.fit(X, y)
+    
+    # Get the best equation found by PySR
+    best_equation = model.get_best()
+    
+    print("Best equation for LJ potential comp-1 as a function of dx, dy, dz, and r:")
+    print(best_equation)      
+
+
 
 def plot_message_sparsity(msg_force_dict):
     msg_array = msg_force_dict['edge_messages'].cpu()
@@ -1175,23 +1270,22 @@ def plot_message_sparsity(msg_force_dict):
     plt.show()
     
 
-
-
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 #gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
-gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
-#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
+gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 
-#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
+are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
 #regress_force_equation(msg_most_imp, msg_force_dict)
+regress_potential_equation(msg_most_imp, msg_force_dict)
 #plot_message_sparsity(msg_force_dict)
 #are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
 #print("Checking potentials now....")
 #are_edge_msgs_gt_potential_correlated(msg_force_dict)
 
 
-plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
-plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
+#plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
+#plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
