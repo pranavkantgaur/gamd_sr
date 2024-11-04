@@ -47,6 +47,9 @@ from typing import List, Set, Dict, Tuple, Optional
 import random
 import time
 from sklearn.preprocessing import StandardScaler
+import matplotlib.tri as mtri
+import pandas as pd
+from pysr import PySRRegressor
 
 # check for CUDA device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -348,8 +351,10 @@ class SmoothConvLayerNew(nn.Module):
             g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)
             
             self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR
-            # TODO: Add aggregate edge message recording.
-            # self.aggregate_edge_messages = 
+            # Add aggregate edge message recording.            
+            self.aggregate_edge_messages = torch.zeros((h.shape[0], g.edata['e_emb'].shape[1]), dtype=torch.float32).cuda()                 
+            self.aggregate_edge_messages.index_add_(0, src_idx, self.edge_message_neigh_center)
+
             if self.update_edge_emb:
                 normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
             g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
@@ -748,7 +753,8 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             # official implementation
             force_pred_official = gamdnet_official([pos],
                                [edge_index_list])
-            msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center                               
+            msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center 
+            msg_force_dict['aggregate_edge_messages'] = gamdnet_official.graph_conv.conv[-1].aggregate_edge_messages
             print("Results from official model:")
             evaluate(force_gt, force_pred_official)
             
@@ -782,6 +788,8 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             msg_force_dict['dy'] = dy[valid_indices][non_zero_rows_mask]
             msg_force_dict['dz'] = dz[valid_indices][non_zero_rows_mask]
             msg_force_dict['potential_gt'] = lj_potential[valid_indices][non_zero_rows_mask]
+            msg_force_dict['net_force_gt'] = force_gt
+            msg_force_dict['pos'] = pos
             
 
         break # run dataloader only once
@@ -1182,12 +1190,7 @@ def regress_force_equation(msg_most_imp, msg_force_dict):
     plt.show()
     '''
 
-def regress_potential_equation(msg_most_imp, msg_force_dict):   
-    
-    import matplotlib.tri as mtri
-    import pandas as pd
-    from pysr import PySRRegressor
-
+def regress_potential_equation(msg_most_imp, msg_force_dict):      
     dx = msg_force_dict['dx'].cpu()
     dy = msg_force_dict['dy'].cpu()
     dz = msg_force_dict['dz'].cpu()
@@ -1271,18 +1274,27 @@ def regress_potential_equation(msg_most_imp, msg_force_dict):
 
 def regress_net_force_per_particle(aggregate_edge_messages, pos, force_gt):
     # Create a DataFrame for easier handling of data
+    agg_msg_stds = torch.std(aggregate_edge_messages, axis = 0)
+    top_std_indices = torch.argsort(agg_msg_stds)[-3:]
+    aggregate_edge_messages_comp_1 = aggregate_edge_messages[:, top_std_indices[-1]] # most imp component
+    aggregate_edge_messages_comp_2 = aggregate_edge_messages[:, top_std_indices[-2]]
+    aggregate_edge_messages_comp_3 = aggregate_edge_messages[:, top_std_indices[-3]]
     data = pd.DataFrame({
         'pos_x': pos[:, 0].cpu().squeeze(),
         'pos_y': pos[:, 1].cpu().squeeze(),
         'pos_z': pos[:, 2].cpu().squeeze(),
-        'aggregate_message': aggregate_edge_messages.cpu().squeeze(),
-        'net_force' : force_gt.cpu().squeeze(),
+        'aggregate_message_1': aggregate_edge_messages_comp_1.cpu().squeeze(),
+        'aggregate_message_2': aggregate_edge_messages_comp_2.cpu().squeeze(),
+        'aggregate_message_3': aggregate_edge_messages_comp_3.cpu().squeeze(),
+        'net_force' : force_gt[:, 0].cpu().squeeze(), # TODO: Repeat for all components of force 
     })
 
     # Define the features and target variable
-    X = data[['pos_x', 'pos_y', 'pos_z', 'aggregate_message']].values
+    X = data[['pos_x', 'pos_y', 'pos_z', 'aggregate_message_1', 'aggregate_message_2', 'aggregate_message_3']].values
     y = data['net_force'].values
-    print("Fitting net particle force....")
+    print("Fitting net particle force component - 1....")
+    
+    '''
     model = PySRRegressor(
     niterations=1000,
     model_selection="accuracy",
@@ -1298,34 +1310,68 @@ def regress_net_force_per_particle(aggregate_edge_messages, pos, force_gt):
     complexity_of_variables=2,
     constraints={"pow": (-1, 1)},  
     )
-  
+    '''
+    
+    model = PySRRegressor(
+        niterations=1000,  # Number of iterations for optimization
+        model_selection="accuracy",
+        binary_operators=['+', '-', '*', '/'],  # Operators to use
+        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
+        # Add more parameters as needed
+    )
+        
     # Fit the model to the data
     model.fit(X, y)
     
     # Get the best equation found by PySR
     best_equation = model.get_best()
     
-    print("Best equation for net particle force as a function of x, y, z, and aggrgeate edge message:")
+    print("Best equation for net particle force comp-1 as a function of x, y, z, and aggrgeate edge message:")
     print(best_equation)
 
     
 
 def predict_force_with_sr(pos, edge_index_list):
-    
-    source_node_idx = edge_index_list[1, :] # TODO: Check convention
-    center_node_idx = edge_index_list[0, :] 
+    center_node_idx = edge_index_list[0, :]
+    source_node_idx = edge_index_list[1, :]     
     
     dx = pos[source_node_idx, 0] - pos[center_node_idx, 0]
     dy = pos[source_node_idx, 1] - pos[center_node_idx, 1]
     dz = pos[source_node_idx, 2] - pos[center_node_idx, 2]
     r = torch.sqrt(torch.pow(dx, 2) + torch.pow(dy, 2) + torch.pow(dz, 2))
-    edge_messages = (((r * r) - inv(0.10865)) ^ -3.4754) * (inv(0.13443 + inv(dy)) - dx) # eq-1 from SR
+    edge_messages_comp_1 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # eq-1 from SR    
+    edge_messages_comp_2 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # TODO: Replace with fitted eq.
+    edge_messages_comp_3 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # TODO: Replace with fitted eq.
+
+    edge_messages = torch.cat((edge_messages_comp_1, edge_messages_comp_2), axis = 1)
+    edge_messages = torch.cat((edge_messages, edge_messages_comp_3), axis = 1)
+    
+    
+    # Predict force field
     pos_x = pos[:, 0]
     pos_y = pos[:, 1]
     pos_z = pos[:, 2]
-    aggregate_edge_messages = torch.index_add_(edge_messages ) # TODO: complete it.
-    force_pred = # TODO, eq-2 from SR
+    aggregated_edge_messages = torch.zeros((pos.shape[0], edge_messages.shape[1]), dtype=torch.float32)
+    aggregate_edge_messages.index_add_(0, center_node_idx, edge_messages)   
+
+
+    agg_msg_stds = torch.std(aggregate_edge_messages, axis = 0)
+    top_std_indices = torch.argsort(agg_msg_stds)[-3:]
+    aggregate_edge_messages_comp_1 = aggregate_edge_messages[:, top_std_indices[-1]] # most imp component
+    aggregate_edge_messages_comp_2 = aggregate_edge_messages[:, top_std_indices[-2]]
+    aggregate_edge_messages_comp_3 = aggregate_edge_messages[:, top_std_indices[-3]]
+
+    x5 = aggregate_edge_messages_comp_3
+    x4 = aggregate_edge_messages_comp_2
+    x3 = aggregate_edge_messages_comp_1
+
+    force_pred_comp_1 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359
+    force_pred_comp_2 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359 # TODO: Replace with fitted eq.
+    force_pred_comp_3 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359 # TODO: Replace with fitted eq.
     
+    force_pred = torch.cat((force_pred_comp_1, force_pred_comp_2), axis = 1)
+    force_pred = torch.cat((force_pred, force_pred_comp_3), axis=1)
+
     return force_pred
 
 
@@ -1340,10 +1386,10 @@ md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 
-are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
+#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
 #regress_force_equation(msg_most_imp, msg_force_dict)
 # REGRESS EQ-1
-regress_potential_equation(msg_most_imp, msg_force_dict)
+#regress_potential_equation(msg_most_imp, msg_force_dict)
 
 
 #plot_message_sparsity(msg_force_dict)
@@ -1356,13 +1402,14 @@ regress_potential_equation(msg_most_imp, msg_force_dict)
 #plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
 
 # REGRESS EQ-2
-aggregate_edge_messages = msg_force_dict['aggregate_edge_message']
+aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']
 pos = msg_force_dict['pos']
 force_gt = msg_force_dict['net_force_gt']
 regress_net_force_per_particle(aggregate_edge_messages, pos, force_gt)
 
+
 # Run inference purely using SR
 for pos, edge_index_list, force_gt in dataloader:
     force_pred = predict_force_with_sr(pos, edge_index_list)
-    evaluate(force_gt, force_pred)
+    evaluate(force_gt.cpu(), force_pred.cpu())
     break
