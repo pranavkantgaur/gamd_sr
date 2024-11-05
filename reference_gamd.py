@@ -10,25 +10,6 @@ from md_module import get_neighbor
 from sklearn.preprocessing import StandardScaler
 
 from typing import List, Set, Dict, Tuple, Optional
-import random
-
-
-
-
-# Set the seed
-seed = 10
-
-# PyTorch seed
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-# Python random seed
-random.seed(seed)
-
-
-
 
 
 def cubic_kernel(r, re):
@@ -91,7 +72,7 @@ class MLP(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
 
     def forward(self, feat):
-        return self.mlp_layer(feat.to('cuda:0'))
+        return self.mlp_layer(feat)
 
 
 class SmoothConvLayerNew(nn.Module):
@@ -110,38 +91,23 @@ class SmoothConvLayerNew(nn.Module):
         if self.update_edge_emb:
             self.edge_layer_norm = nn.LayerNorm(in_edge_feats)
 
-        # TODO-10: Whether edge_affine and src, dst affine matters?
-        #self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
-        #self.src_affine = nn.Linear(in_node_feats, hidden_dim)
-        #self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
-        # Set the seed
-        seed = 10
-
-        # PyTorch seed
-        torch.manual_seed(seed)        
+        # self.theta_src = nn.Linear(in_node_feats, hidden_dim)
+        self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
+        self.src_affine = nn.Linear(in_node_feats, hidden_dim)
+        self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
         self.theta_edge = MLP(hidden_dim, in_node_feats,
                               hidden_dim=hidden_dim, activation=activation, activation_first=True,
                               hidden_layer=2)
         # self.theta = MLP(hidden_dim, hidden_dim, activation_first=True, hidden_layer=2)
-        
-        # TODO-12: Whether phi_dst, phi_edge matter? NOT MUCH.
-        #self.phi_dst = nn.Linear(in_node_feats, hidden_dim)
-        #self.phi_edge = nn.Linear(in_node_feats, hidden_dim)
-        
-        # Set the seed
-        seed = 10
 
-        # PyTorch seed
-        torch.manual_seed(seed)        
-
+        self.phi_dst = nn.Linear(in_node_feats, hidden_dim)
+        self.phi_edge = nn.Linear(in_node_feats, hidden_dim)
         self.phi = MLP(hidden_dim, out_node_feats,
                        activation_first=True, hidden_layer=1, hidden_dim=hidden_dim, activation=activation)
 
     def forward(self, g: dgl.DGLGraph, node_feat: torch.Tensor) -> torch.Tensor:
-        h = node_feat.clone().to('cuda:0')
+        h = node_feat.clone()
         with g.local_scope():
-            ## TODO-9: Whether edge dropout matters? No
-            '''
             if self.drop_edge and self.training:
                 src_idx, dst_idx = g.edges()
                 e_feat = g.edata['e'].clone()
@@ -154,7 +120,6 @@ class SmoothConvLayerNew(nn.Module):
                 e_feat = e_feat[keep_idx]
                 g = dgl.graph((src_idx, dst_idx))
                 g.edata['e'] = e_feat
-            '''
             # for multi batch training
             if g.is_block:
                 h_src = h
@@ -167,73 +132,21 @@ class SmoothConvLayerNew(nn.Module):
             edge_idx = g.edges()
             src_idx = edge_idx[0]
             dst_idx = edge_idx[1]
-            
-            
-            # TODO-10: Whether edge_affine and src, dst affine matters? No
-            #edge_code = self.edge_affine(g.edata['e'])
-            edge_code = g.edata['e']
-            #src_code = self.src_affine(h_src[src_idx])
-            src_code = h_src[src_idx]
-            #dst_code = self.dst_affine(h_dst[dst_idx])
-            dst_code = h_dst[dst_idx]
+            edge_code = self.edge_affine(g.edata['e'])
+            src_code = self.src_affine(h_src[src_idx])
+            dst_code = self.dst_affine(h_dst[dst_idx])
             g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)
-            #print(f"INFO: theta edge before PHI: {g.edata['e_emb'][150]}")
-            #print(f"INFO: edge embeddings before PHI: {edge_code[150]}")
+            self.edge_message_neigh_center = src_code * g.edata['e_emb'] # Recording messages for messgage regularisation
+            self.input_node_embeddings = h # Recording messages for node embedding regularisation
+
             if self.update_edge_emb:
-                normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])           
-            
-            node_embeddings = g.ndata['h'].clone()
-            g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))            
+                normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
+            g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
             edge_emb = g.ndata['h']
 
-            '''    
-            # Compute edge messages
-            edge_idx = g.edges()
-            edges_src = edge_idx[0]
-            edges_dst = edge_idx[1]        
-            node_j_embedding = node_embeddings[edges_src]
-            theta_edge = g.edata['e_emb']
-            edge_message_j_i = (node_j_embedding * theta_edge).to(torch.float16)  # Convert to float16
-
-            #print("edge message: ", edge_message_j_i[150])
-            # Collect edge messages received by each node
-            device = "cuda"
-            node_edge_messages = [[torch.zeros(node_embeddings.shape[1], dtype=torch.float16).to(device)] for _ in range(node_embeddings.shape[0])]  # Use float16
-            print("Edge index list: ", len(edges_dst), edges_dst[350])
-            for edge_id, edge_message in enumerate(edge_message_j_i):  # edge_message is already float16
-                node_i_index = edges_dst[edge_id]
-                
-                if node_i_index >= len(node_edge_messages):  # Fixed the condition to use >= instead of >
-                    print(f"BUG: {node_i_index} >= {len(node_edge_messages)}")   
-                    exit(0)           
-                
-                node_edge_messages[node_i_index].append(edge_message)  # edge_message is float16
-            #print("Node messages list: ", node_edge_messages[150])    
-            #exit(0)
-            # Aggregate edge messages for each node
-            aggregated_edge_messages = torch.cat(
-                [torch.sum(torch.stack(row), dim=0).unsqueeze(0) for row in node_edge_messages],
-                dim=0
-            ).to(torch.float16)  # Ensure the result is float16
-
-            print(f"INFO OURS: Before Phi: node_embedding: {node_embeddings[150]}, aggregate message: {aggregated_edge_messages[150]}")
-            '''
-
-
-
-        if self.update_edge_emb:            
+        if self.update_edge_emb:
             g.edata['e'] = normalized_e_emb
-        # TODO-11: Whether phi_dst, phi_edge matter?
-        #node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb))
-        #print("Shape of aggregate messages: ", edge_emb.shape)   
-
-
-
-        
-        #print(f"INFO: Before Phi: node_embedding: {h[150]}, aggregate message: {edge_emb[150]}")                
-        #print("Edge index list before PHI: ", len(dst_idx), dst_idx[350], src_idx[350])
-        
-        node_feat = self.phi(h + edge_emb)
+        node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb))
         return node_feat
 
 
@@ -279,34 +192,19 @@ class SmoothConvBlockNew(nn.Module):
                                                  activation=activation,
                                                  drop_edge=drop_edge,
                                                  update_edge_emb=update_egde_emb))
-            ## TODO-8: Whether layer norm matters?            
             if use_layer_norm:
-                # Set the seed
-                seed = 10
-
-                # PyTorch seed
-                torch.manual_seed(seed)                
                 self.norm_layers.append(nn.LayerNorm(out_node_feats))
             elif use_batch_norm:
                 self.norm_layers.append(nn.BatchNorm1d(out_node_feats))
-            
+
     def forward(self, h: torch.Tensor, graph: dgl.DGLGraph) -> torch.Tensor:
 
         for l, conv_layer in enumerate(self.conv):
-            ## TODO-7: Whether residual connection matter?
-            #h = conv_layer.forward(graph, self.norm_layers[l](h))            
-            ## TODO-8: Whether layer norm matters?
-            #h = conv_layer.forward(graph, h) + h            
-            #print(f"INFO: node_embeddings received: {h[100]}, edge embeddings: {graph.edata['e'][100]}")
-            #print(f"INFO: edge list received: {graph.edges()[0][100]}, {graph.edges()[1][100]}")  
             if self.use_layer_norm or self.use_batch_norm:
-                h = conv_layer.forward(graph, self.norm_layers[l](h)) + h                
-                #print(f"INFO: node_embeddings after first MP: {h[100]}, edge embeddings: {graph.edata['e'][100]}")
-                #print(f"INFO: edge list after first MP: {graph.edges()[0][100]}, {graph.edges()[1][100]}")                  
-                #exit(0)
+                h = conv_layer.forward(graph, self.norm_layers[l](h)) + h
             else:
                 h = conv_layer.forward(graph, h) + h
-            
+
         return h
 
 
@@ -685,38 +583,22 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
                                              activation='silu')
 
         self.edge_emb_dim = edge_embedding_dim
-        #self.edge_expand = RBFExpansion(high=1, gap=0.025)
-        #self.edge_drop_out = nn.Dropout(dropout)
+        self.edge_expand = RBFExpansion(high=1, gap=0.025)
+        self.edge_drop_out = nn.Dropout(dropout)
 
-        #self.length_mean = nn.Parameter(torch.tensor([0.]), requires_grad=False)
-        #self.length_std = nn.Parameter(torch.tensor([1.]), requires_grad=False)
-        #self.length_scaler = StandardScaler()
+        self.length_mean = nn.Parameter(torch.tensor([0.]), requires_grad=False)
+        self.length_std = nn.Parameter(torch.tensor([1.]), requires_grad=False)
+        self.length_scaler = StandardScaler()
 
         if isinstance(box_size, np.ndarray):
             self.box_size = torch.from_numpy(box_size).float()
         else:
             self.box_size = box_size
         self.box_size = self.box_size
-        # Set the seed
-        seed = 10
 
-        # PyTorch seed
-        torch.manual_seed(seed)        
         self.node_emb = nn.Parameter(torch.randn((1, encoding_size)), requires_grad=True)
-        #self.edge_encoder = MLP(3 + 1 + len(self.edge_expand.centers), self.edge_emb_dim, hidden_dim=hidden_dim,
-        #                        activation='gelu')
-        ## TODO-2
-        #self.edge_encoder = MLP(3 + 1, self.edge_emb_dim, hidden_dim=hidden_dim,
-        #                        activation='gelu')        
-        ## TODO-3      
-        # Set the seed
-        seed = 10
-
-        # PyTorch seed
-        torch.manual_seed(seed)                                     
-        self.edge_encoder = MLP(3, self.edge_emb_dim, hidden_dim=hidden_dim,
-                                activation='gelu')                
-        # TODO-5: Whether edge layer norm matters? YES
+        self.edge_encoder = MLP(3 + 1 + len(self.edge_expand.centers), self.edge_emb_dim, hidden_dim=hidden_dim,
+                                activation='gelu')
         self.edge_layer_norm = nn.LayerNorm(self.edge_emb_dim)
         self.graph_decoder = MLP(encoding_size, out_feats, hidden_layer=2, hidden_dim=hidden_dim, activation='gelu')
 
@@ -726,22 +608,13 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
                        pos_src: torch.Tensor,
                        pos_dst=None) -> torch.Tensor:
         # this is the raw input feature
-        
+
         # to enhance computation performance, dont track their calculation on graph
         if pos_dst is None:
             pos_dst = pos_src
 
         with torch.no_grad():
-            # Assuming pos_dst and pos_src are already on cuda:2
-            #pos_dst = pos_dst.to('cuda:2')
-            #pos_src = pos_src.to('cuda:2')
-
-            # Move indices to the same device
-            #dst_idx = dst_idx.to(pos_dst.device)  # Move dst_idx to the same device as pos_dst
-            #src_idx = src_idx.to(pos_src.device)  # Move src_idx to the same device as pos_src
-
             rel_pos = pos_dst[dst_idx.long()] - pos_src[src_idx.long()]
-        '''
             if isinstance(self.box_size, torch.Tensor):
                 rel_pos_periodic = torch.remainder(rel_pos + 0.5 * self.box_size.to(rel_pos.device),
                                                    self.box_size.to(rel_pos.device)) - 0.5 * self.box_size.to(rel_pos.device)
@@ -756,22 +629,10 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
             self.fit_length(rel_pos_norm)
             self._update_length_stat(self.length_scaler.mean_, np.sqrt(self.length_scaler.var_))
 
-        rel_pos_norm = (rel_pos_norm - self.length_mean) / self.length_std        
-        
+        rel_pos_norm = (rel_pos_norm - self.length_mean) / self.length_std
         edge_feat = torch.cat((rel_pos_periodic,
                                rel_pos_norm,
                                self.edge_expand(rel_pos_norm)), dim=1)
-                                           
-        # TODO-1: Test code (does periodic boundary condition really matter?)
-        rel_pos_norm = rel_pos.norm(dim=1).view(-1, 1)  # [edge_num, 1]
-        edge_feat = torch.cat((rel_pos,
-        rel_pos_norm, self.edge_expand(rel_pos_norm)), dim=1)
-        # TODO-2: Whether edge expand matters?
-        edge_feat = torch.cat((rel_pos,
-        rel_pos_norm), dim=1)  
-        '''      
-        # TODO-3: Whether rel_pos_norm matters?
-        edge_feat = rel_pos
         return edge_feat
 
     def build_graph(self,
@@ -783,26 +644,14 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
         neigh_idx = fluid_edge_idx[1, :]
         fluid_graph = dgl.graph((neigh_idx, center_idx))
         fluid_edge_feat = self.calc_edge_feat(center_idx, neigh_idx, fluid_pos)
-        #print(f"INFO: edge features: {fluid_edge_feat[150]}")    
-        # TODO-5: Whether edge layer norm matters? YES     
+
         fluid_edge_emb = self.edge_layer_norm(self.edge_encoder(fluid_edge_feat))  # [edge_num, 64]
-        #fluid_edge_emb = self.edge_encoder(fluid_edge_feat)  # [edge_num, 64]
-        #print(f"INFO: edge layernorm: {fluid_edge_emb[150]}")
-        # TODO-4: Whether edge dropout matters? No.
-        #fluid_edge_emb = self.edge_drop_out(fluid_edge_emb)
-        #fluid_graph.edata['e'] = fluid_edge_emb
-
-        # Move edge features to cuda:0
-        edge_features = fluid_edge_emb.to('cuda:0')        
-        fluid_graph.edata['e'] = edge_features  # Now assign edge features
-
+        fluid_edge_emb = self.edge_drop_out(fluid_edge_emb)
+        fluid_graph.edata['e'] = fluid_edge_emb
 
         # add self loop for fluid particles
-        ## TODO-6: Whether self-loops matter? No.
-        '''
         if self_loop:
             fluid_graph.add_self_loop()
-        '''
         return fluid_graph
 
     def build_graph_batches(self, pos_lst, edge_idx_lst):
@@ -831,12 +680,9 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
         else:
             fluid_graph = self.build_graph(fluid_edge_lst[0], fluid_pos_lst[0])
         num = np.sum([pos.shape[0] for pos in fluid_pos_lst])
-        x = self.node_emb.repeat((num, 1))        
-        #print(f"INFO: node_embeddings: {x[100]}, edge embeddings: {fluid_graph.edata['e'][100]}")
-        #print(f"INFO: edge list: {fluid_graph.edges()[0][100]}, {fluid_graph.edges()[1][100]}")        
+        x = self.node_emb.repeat((num, 1))
         x = self.graph_conv(x, fluid_graph)
-        #print(f"INFO: FINAL node_embeddings: {x[100]}")
-        #exit(0)
+
         x = self.graph_decoder(x)
         return x
 
