@@ -350,19 +350,17 @@ class SmoothConvLayerNew(nn.Module):
             dst_code = self.dst_affine(h_dst[dst_idx])
             g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)
             
-            self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR
-            # Add aggregate edge message recording.            
-            self.aggregate_edge_messages = torch.zeros((h.shape[0], g.edata['e_emb'].shape[1]), dtype=torch.float32).cuda()                 
-            self.aggregate_edge_messages.index_add_(0, src_idx, self.edge_message_neigh_center)
+            self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR           
 
             if self.update_edge_emb:
                 normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
             g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
             edge_emb = g.ndata['h']
-
+            self.aggregate_edge_messages = edge_emb # Add aggregate edge message recording, SR. Can be used for verifying the predicted aggregated edge messages based on SR for edge message function.
+            self.input_node_embeddings = h
         if self.update_edge_emb:
             g.edata['e'] = normalized_e_emb
-        node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb))
+        node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb)) # So, we need to predict edge_emb (aggrgated edge messages), h (input node embeddings) inputs for the last message passing layer using SR to effecitively couple SR with the remaining GNN.  
         return node_feat
 
 
@@ -790,6 +788,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             msg_force_dict['potential_gt'] = lj_potential[valid_indices][non_zero_rows_mask]
             msg_force_dict['net_force_gt'] = force_gt
             msg_force_dict['pos'] = pos
+            msg_force_dict['node_embeddings'] = gamdnet_official.graph_conv.conv[-1].input_node_embeddings
             
 
         break # run dataloader only once
@@ -797,13 +796,13 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
 
 
 
-def plot_message_sparsity(msg_force_dict):
-    msg_array = msg_force_dict['edge_messages'].cpu()
+def plot_param_sparsity(msg_force_dict, param_name):
+    msg_array = msg_force_dict[param_name].cpu()
     msg_importance = msg_array.std(axis=0)        
     
     top_std_indices = torch.argsort(msg_importance)[-15:]
     top_importance_values = msg_importance[top_std_indices].numpy()
-    print("Message sparsity: ", top_importance_values)
+    print(f"{param_name} sparsity: ", top_importance_values)
     fig, ax = plt.subplots(1, 1)
     ax.pcolormesh(top_importance_values[None, ], cmap='gray_r', edgecolors='k')
     plt.axis('off')
@@ -1017,7 +1016,6 @@ def plot_lj_force_vs_rad_dist_with_messages(msg_force_dict):
 
 
 
-
 def plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict):
     edge_messages = msg_force_dict['edge_messages'].cpu()
     lj_potential = msg_force_dict['potential_gt'].cpu()
@@ -1058,150 +1056,20 @@ def plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict):
 
 
 ################################################## Do, symbolic regression if linearity exists #########################################
-def regress_force_equation(msg_most_imp, msg_force_dict):   
+def regress_edge_message_equation(msg_force_dict):     
     
-    import matplotlib.tri as mtri
-    import pandas as pd
-    from pysr import PySRRegressor
-
     dx = msg_force_dict['dx'].cpu()
     dy = msg_force_dict['dy'].cpu()
     dz = msg_force_dict['dz'].cpu()
     r = msg_force_dict['radial_distance'].cpu()
     
-    z1 = msg_most_imp[:, 0].cpu()
-    z2 = msg_force_dict['force_gt'][:, 0].cpu()
-    
-    # Create a DataFrame for easier handling of data
-    data = pd.DataFrame({
-        'dx': dx.squeeze(),
-        'dy': dy.squeeze(),
-        'dz': dz.squeeze(),
-        'r': r.squeeze(),
-        'z1': z1.squeeze(),
-        'z2': z2.squeeze()        
-    })
-    
-    # Define the features and target variable
-    X = data[['dx', 'dy', 'dz', 'r']].values
-    y = data['z1'].values
-    
-    # Initialize the PySR regressor
-    '''
-    model = PySRRegressor(
-        niterations=1000,  # Number of iterations for optimization
-        binary_operators=['+', '-', '*', '/'],  # Operators to use
-        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
-        # Add more parameters as needed
-    )
-    '''
-    # Initialize the PySR regressor with adjusted operators
-    model = PySRRegressor(
-    niterations=1000,  # < Increase me for better results
-    binary_operators=["+", "*", "-", "/", "pow"],
-    unary_operators=[
-        "inv(x) = 1/x",
-        # ^ Custom operator (julia syntax)
-    ],
-    extra_sympy_mappings={"inv": lambda x: 1 / x},
-    # ^ Define operator for SymPy as well
-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-    # ^ Custom loss function (julia syntax)
-    )
-  
-    # Fit the model to the data
-    model.fit(X, y)
-    
-    # Get the best equation found by PySR
-    best_equation = model.get_best()
-    
-    print("Best equation for z1 as a function of dx, dy, dz, and r:")
-    print(best_equation)
-    
-    
-    print("Fitting LJ force now....")
-    '''
-    # Initialize the PySR regressor
-    model = PySRRegressor(
-        niterations=1000,  # Number of iterations for optimization
-        binary_operators=['+', '-', '*', '/'],  # Operators to use
-        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
-        # Add more parameters as needed
-    )
-    '''
-    # Initialize the PySR regressor with adjusted operators
-    model = PySRRegressor(
-    niterations=1000,  # < Increase me for better results
-    binary_operators=["+", "*", "-", "/", "pow"],
-    unary_operators=[
-        "inv(x) = 1/x",
-        # ^ Custom operator (julia syntax)
-    ],
-    extra_sympy_mappings={"inv": lambda x: 1 / x},
-    # ^ Define operator for SymPy as well
-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-    # ^ Custom loss function (julia syntax)
-    )
-
-    y = data['z2'].values
-    # Fit the model to the data
-    model.fit(X, y)
-    
-    # Get the best equation found by PySR
-    best_equation = model.get_best()
-    
-    print("Best equation for z2 as a function of dx, dy, dz, and r:")
-    print(best_equation)      
-        
-    '''
-
-    # Create a figure for multiple surfaces
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Loop through different values of dz
-    unique_dzs = torch.unique(dz)
-    for k in unique_dzs[:3]:       
-        
-        # Get boolean mask where T's value is equal to K
-        mask = (dz == k)
-        # Count the number of rows in T with value equal to K
-        count_k = mask.sum().item()  # Convert tensor to Python integer
-        print("Count of rows in T with value =", k, ":", count_k)
-        
-        
-        dx1 = dx[mask]
-        dy1 = dy[mask]
-        z11 = z1[mask]
-        print("CHECK: ", dx1.shape, dy1.shape)
-        #ax.plot_surface(dx1, dy1, z11, alpha=0.5, label=f'dz={k}')  # Set alpha for transparency
-        # Create a Delaunay triangulation of the (x, y) points
-        triang = mtri.Triangulation(dx1, dy1)
-        # Plot the surface using the triangulation
-        ax.plot_trisurf(triang, z11, cmap='viridis', alpha=0.5, label=f'K={k}')
-    
-    # Add labels and title
-    ax.set_xlabel('X Axis')
-    ax.set_ylabel('Y Axis')
-    ax.set_zlabel('Z Axis')
-    ax.set_title('3D Surface Plots of Message component-1 for Different Values of dz')
-    
-    # Show the plot
-    plt.show()
-    '''
-
-def regress_potential_equation(msg_most_imp, msg_force_dict):      
-    dx = msg_force_dict['dx'].cpu()
-    dy = msg_force_dict['dy'].cpu()
-    dz = msg_force_dict['dz'].cpu()
-    r = msg_force_dict['radial_distance'].cpu()
-    
+    msg_comp_std = torch.std(msg_force_dict['edge_messages'], axis = 0)
+    msg_comp_most_imp_indices = torch.argsort(msg_comp_std)[-3:] # in ascending order
+    msg_most_imp = msg_force_dict['edge_messages'][:, msg_comp_most_imp_indices]
     z1 = msg_most_imp[:, -1].cpu() # the one with highest std
-    potential_stds = torch.std(msg_force_dict['potential_gt'], axis=0)
-    potential_id = torch.argsort(potential_stds)[-1] # the one with highest std
-    print("Using potential component: ", potential_id)
-    z2 = msg_force_dict['potential_gt'][:, potential_id].cpu()
-    
+    z2 = msg_most_imp[:, -2].cpu()
+    z3 = msg_most_imp[:, -3].cpu()
+
     # Create a DataFrame for easier handling of data
     data = pd.DataFrame({
         'dx': dx.squeeze(),
@@ -1209,173 +1077,114 @@ def regress_potential_equation(msg_most_imp, msg_force_dict):
         'dz': dz.squeeze(),
         'r': r.squeeze(),
         'z1': z1.squeeze(),
-        'z2': z2.squeeze()        
+        'z2': z2.squeeze(),
+        'z3': z3.squeeze(),
     })
     
     # Define the features and target variable
     X = data[['dx', 'dy', 'dz', 'r']].values
-    y = data['z1'].values
-    print("Fitting edge message comp-1 now....")
-    model = PySRRegressor(
-    niterations=1000,
-    model_selection="accuracy",
-    binary_operators=["-", "*", "/", "pow", "+"],        
-    unary_operators=[
-        "inv(x) = 1/x",
-        # ^ Custom operator (julia syntax)
-    ],      
-    extra_sympy_mappings={"inv": lambda x: 1 / x},
-    # ^ Define operator for SymPy as well
-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-    # ^ Custom loss function (julia syntax)  
-    complexity_of_variables=2,
-    constraints={"pow": (-1, 1)},  
-    )
-  
-    # Fit the model to the data
-    model.fit(X, y)
     
-    # Get the best equation found by PySR
-    best_equation = model.get_best()
-    
-    print("Best equation for edge message comp-1 as a function of dx, dy, dz, and r:")
-    print(best_equation)
-    
-    
-    print("Fitting LJ potential comp-1 now....")
-    # Initialize the PySR regressor with adjusted operators
-    model = PySRRegressor(
-    niterations=1000,
-    model_selection="accuracy",
-    binary_operators=["-", "*", "/", "pow", "+"],        
-    unary_operators=[
-        "inv(x) = 1/x",
-        # ^ Custom operator (julia syntax)
-    ],    
-    extra_sympy_mappings={"inv": lambda x: 1 / x},
-    # ^ Define operator for SymPy as well
-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-    # ^ Custom loss function (julia syntax)    
-    complexity_of_variables=2,
-    constraints={"pow": (-1, 1)},    
-    )
-  
-
-    y = data['z2'].values
-    # Fit the model to the data
-    model.fit(X, y)
-    
-    # Get the best equation found by PySR
-    best_equation = model.get_best()
-    
-    print("Best equation for LJ potential comp-1 as a function of dx, dy, dz, and r:")
-    print(best_equation)      
-
-
-def regress_net_force_per_particle(aggregate_edge_messages, pos, force_gt):
-    # Create a DataFrame for easier handling of data
-    agg_msg_stds = torch.std(aggregate_edge_messages, axis = 0)
-    top_std_indices = torch.argsort(agg_msg_stds)[-3:]
-    aggregate_edge_messages_comp_1 = aggregate_edge_messages[:, top_std_indices[-1]] # most imp component
-    aggregate_edge_messages_comp_2 = aggregate_edge_messages[:, top_std_indices[-2]]
-    aggregate_edge_messages_comp_3 = aggregate_edge_messages[:, top_std_indices[-3]]
-    data = pd.DataFrame({
-        'pos_x': pos[:, 0].cpu().squeeze(),
-        'pos_y': pos[:, 1].cpu().squeeze(),
-        'pos_z': pos[:, 2].cpu().squeeze(),
-        'aggregate_message_1': aggregate_edge_messages_comp_1.cpu().squeeze(),
-        'aggregate_message_2': aggregate_edge_messages_comp_2.cpu().squeeze(),
-        'aggregate_message_3': aggregate_edge_messages_comp_3.cpu().squeeze(),
-        'net_force' : force_gt[:, 0].cpu().squeeze(), # TODO: Repeat for all components of force 
-    })
-
-    # Define the features and target variable
-    X = data[['pos_x', 'pos_y', 'pos_z', 'aggregate_message_1', 'aggregate_message_2', 'aggregate_message_3']].values
-    y = data['net_force'].values
-    print("Fitting net particle force component - 1....")
-    
-    '''
-    model = PySRRegressor(
-    niterations=1000,
-    model_selection="accuracy",
-    binary_operators=["-", "*", "/", "pow", "+"],        
-    unary_operators=[
-        "inv(x) = 1/x",
-        # ^ Custom operator (julia syntax)
-    ],      
-    extra_sympy_mappings={"inv": lambda x: 1 / x},
-    # ^ Define operator for SymPy as well
-    elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-    # ^ Custom loss function (julia syntax)  
-    complexity_of_variables=2,
-    constraints={"pow": (-1, 1)},  
-    )
-    '''
-    
-    model = PySRRegressor(
-        niterations=1000,  # Number of iterations for optimization
+    for comp_id in range(3):
+        y = data[f"z{comp_id + 1}"].values
+        print(f"Fitting edge message comp-{comp_id + 1} now....")
+        model = PySRRegressor(
+        niterations=1000,
         model_selection="accuracy",
-        binary_operators=['+', '-', '*', '/'],  # Operators to use
-        unary_operators=['sin', 'cos', 'tan', 'exp', 'log'],  # Unary operators
-        # Add more parameters as needed
-    )
+        binary_operators=["-", "*", "/", "pow", "+"],        
+        unary_operators=[
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],      
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+        # ^ Custom loss function (julia syntax)  
+        complexity_of_variables=2,
+        constraints={"pow": (-1, 1)},  
+        )
+    
+        # Fit the model to the data
+        model.fit(X, y)
         
-    # Fit the model to the data
-    model.fit(X, y)
+        # Get the best equation found by PySR
+        best_equation = model.get_best()
+        
+        print(f"Best equation for edge message comp-{comp_id + 1} as a function of dx, dy, dz, and r:")
+        print(best_equation)
+
+
+def regress_node_embedding_equation(msg_force_dict):    
+    x = msg_force_dict['pos'][:, 0].cpu()
+    y = msg_force_dict['pos'][:, 1].cpu()
+    z = msg_force_dict['pos'][:, 2].cpu()    
     
-    # Get the best equation found by PySR
-    best_equation = model.get_best()
+    aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']    
+    agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
+    agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
+    agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
     
-    print("Best equation for net particle force comp-1 as a function of x, y, z, and aggrgeate edge message:")
-    print(best_equation)
+    agg_comp_1 = agg_msg_most_imp[:, -1].cpu() # the one with highest std
+    agg_comp_2 = agg_msg_most_imp[:, -2].cpu()
+    agg_comp_3 = agg_msg_most_imp[:, -3].cpu()
 
+    node_embeddings = msg_force_dict['node_embeddings']    
+    node_embeddings_comp_std = torch.std(node_embeddings, axis = 0)
+    k = 3 # tune it to the number of most imp. components in node embeddings.
+    node_embeddings_comp_most_imp_indices = torch.argsort(node_embeddings_comp_std)[-k:] # in ascending order
+    node_embeddings_comp_most_imp = node_embeddings[:, node_embeddings_comp_most_imp_indices]
+
+
+    node_emb_comp_1 = node_embeddings_comp_most_imp[:, -1].cpu() # the one with highest std
+    node_emb_comp_2 = node_embeddings_comp_most_imp[:, -2].cpu()
+    node_emb_comp_3 = node_embeddings_comp_most_imp[:, -3].cpu()
+
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'x': x.squeeze(),
+        'y': y.squeeze(),
+        'd': z.squeeze(),        
+        'agg_comp_1': agg_comp_1.squeeze(),
+        'agg_comp_2': agg_comp_2.squeeze(),
+        'agg_comp_3': agg_comp_3.squeeze(),
+        'node_embed_comp_1': node_emb_comp_1.squeeze(),
+        'node_embed_comp_2': node_emb_comp_2.squeeze(),
+        'node_embed_comp_3': node_emb_comp_3.squeeze(),
+    })
     
-
-def predict_force_with_sr(pos, edge_index_list):
-    center_node_idx = edge_index_list[0, :]
-    source_node_idx = edge_index_list[1, :]     
+    # Define the features and target variable
+    X = data[['dx', 'dy', 'dz', 'r']].values
     
-    dx = pos[source_node_idx, 0] - pos[center_node_idx, 0]
-    dy = pos[source_node_idx, 1] - pos[center_node_idx, 1]
-    dz = pos[source_node_idx, 2] - pos[center_node_idx, 2]
-    r = torch.sqrt(torch.pow(dx, 2) + torch.pow(dy, 2) + torch.pow(dz, 2))
-    edge_messages_comp_1 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # eq-1 from SR    
-    edge_messages_comp_2 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # TODO: Replace with fitted eq.
-    edge_messages_comp_3 = torch.pow((torch.pow(r, 2.0) - (1.0 /  0.10865)), -3.4754) * (1.0 / (0.13443 + (1.0 / dy)) - dx) # TODO: Replace with fitted eq.
-
-    edge_messages = torch.cat((edge_messages_comp_1, edge_messages_comp_2), axis = 1)
-    edge_messages = torch.cat((edge_messages, edge_messages_comp_3), axis = 1)
+    for comp_id in range(3):
+        y = data[f"z{comp_id + 1}"].values
+        print(f"Fitting edge message comp-{comp_id + 1} now....")
+        model = PySRRegressor(
+        niterations=1000,
+        model_selection="accuracy",
+        binary_operators=["-", "*", "/", "pow", "+"],        
+        unary_operators=[
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],      
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+        # ^ Custom loss function (julia syntax)  
+        complexity_of_variables=2,
+        constraints={"pow": (-1, 1)},  
+        )
     
-    
-    # Predict force field
-    pos_x = pos[:, 0]
-    pos_y = pos[:, 1]
-    pos_z = pos[:, 2]
-    aggregated_edge_messages = torch.zeros((pos.shape[0], edge_messages.shape[1]), dtype=torch.float32)
-    aggregate_edge_messages.index_add_(0, center_node_idx, edge_messages)   
-
-
-    agg_msg_stds = torch.std(aggregate_edge_messages, axis = 0)
-    top_std_indices = torch.argsort(agg_msg_stds)[-3:]
-    aggregate_edge_messages_comp_1 = aggregate_edge_messages[:, top_std_indices[-1]] # most imp component
-    aggregate_edge_messages_comp_2 = aggregate_edge_messages[:, top_std_indices[-2]]
-    aggregate_edge_messages_comp_3 = aggregate_edge_messages[:, top_std_indices[-3]]
-
-    x5 = aggregate_edge_messages_comp_3
-    x4 = aggregate_edge_messages_comp_2
-    x3 = aggregate_edge_messages_comp_1
-
-    force_pred_comp_1 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359
-    force_pred_comp_2 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359 # TODO: Replace with fitted eq.
-    force_pred_comp_3 = ((x5 * ((2.772 - x5) * torch.tan(0.78424 * torch.tan(torch.cos(torch.exp(2.3208 * torch.tan(x4))))))) - x3) + -0.20359 # TODO: Replace with fitted eq.
-    
-    force_pred = torch.cat((force_pred_comp_1, force_pred_comp_2), axis = 1)
-    force_pred = torch.cat((force_pred, force_pred_comp_3), axis=1)
-
-    return force_pred
+        # Fit the model to the data
+        model.fit(X, y)
+        
+        # Get the best equation found by PySR
+        best_equation = model.get_best()
+        
+        print(f"Best equation for edge message comp-{comp_id + 1} as a function of dx, dy, dz, and r:")
+        print(best_equation)
 
 
 
+    return
 
 
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
@@ -1386,30 +1195,29 @@ md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 
-#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
-#regress_force_equation(msg_most_imp, msg_force_dict)
+'''
+print("Visualizing sparsity of message components...")
+plot_param_sparsity(msg_force_dict, "edge_messages")
+
+print("Checking potentials now....")
+are_edge_msgs_gt_potential_correlated(msg_force_dict)
+'''
 # REGRESS EQ-1
-#regress_potential_equation(msg_most_imp, msg_force_dict)
-
-
-#plot_message_sparsity(msg_force_dict)
-#are_correlated, msg_most_imp = are_edge_msgs_gt_force_correlated(msg_force_dict)
-#print("Checking potentials now....")
-#are_edge_msgs_gt_potential_correlated(msg_force_dict)
-
+#print("Finding equations for top-3 message components...")
+#regress_edge_message_equation(msg_force_dict)
 
 #plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
 #plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
 
+#print("Visualizing sparsity of node embedding components...")
+#plot_param_sparsity(msg_force_dict, "node_embeddings")
 # REGRESS EQ-2
-aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']
-pos = msg_force_dict['pos']
-force_gt = msg_force_dict['net_force_gt']
-regress_net_force_per_particle(aggregate_edge_messages, pos, force_gt)
+regress_node_embedding_equation(msg_force_dict)
 
-
+'''
 # Run inference purely using SR
 for pos, edge_index_list, force_gt in dataloader:
     force_pred = predict_force_with_sr(pos, edge_index_list)
     evaluate(force_gt.cpu(), force_pred.cpu())
     break
+'''
