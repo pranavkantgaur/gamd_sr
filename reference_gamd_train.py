@@ -115,7 +115,7 @@ class ParticleNetLightning(pl.LightningModule):
         self.rotate_aug = args.rotate_aug
         self.data_dir = args.data_dir
         self.loss_fn = args.loss
-        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message']
+        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message', 'l1_message_node_embed']
 
     def load_training_stats(self, scaler_ckpt):
         if scaler_ckpt is not None:
@@ -187,7 +187,7 @@ class ParticleNetLightning(pl.LightningModule):
         return edge_idx_tsr
 
     def search_for_neighbor(self, pos, nbr_searcher, masking_fn, type_name):
-        pos_jax = jax.device_put(pos, jax.devices("gpu")[0])
+        pos_jax = jax.device_put(pos, jax.devices("gpu")[1])
 
         if not nbr_searcher.has_been_init:
             nbrs = nbr_searcher.init_new_neighbor_lst(pos_jax)
@@ -239,8 +239,7 @@ class ParticleNetLightning(pl.LightningModule):
             regularization = 1e-2
             m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
             normalized_l05 = torch.mean(torch.abs(m12))
-            mae = nn.L1Loss()(pred, gt)            
-            #message_regularization = regularization * self.batch_size * normalized_l05 / NUM_OF_ATOMS**2 * NUM_OF_ATOMS
+            mae = nn.L1Loss()(pred, gt)                        
             message_regularization_term = regularization * normalized_l05
             loss = mae + message_regularization_term             
         elif self.loss_fn == 'kl_message':
@@ -250,6 +249,19 @@ class ParticleNetLightning(pl.LightningModule):
             logvar = raw_msg[:, 1::2]
             full_kl = torch.mean(torch.exp(logvar) + mu**2 - logvar)/2.0
             loss = mae + full_kl
+        elif self.loss_fn == 'l1_message_node_embed':
+            regularization = 1e-2
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            normalized_l05 = torch.mean(torch.abs(m12))                                    
+            message_regularization_term = regularization * normalized_l05            
+            
+            n12 = self.pnet_model.graph_conv.conv[-1].input_node_embeddings
+            normalized_n05 = torch.mean(torch.abs(n12))
+            node_embed_regularization_term = regularization * normalized_n05
+            
+            mae = nn.L1Loss()(pred, gt)
+            
+            loss = mae + message_regularization_term + node_embed_regularization_term                         
 
         else:
             loss = nn.MSELoss()(pred, gt)
