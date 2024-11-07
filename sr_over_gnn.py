@@ -660,7 +660,7 @@ def load_model_and_dataset(gamdnet_model_filename, gamdnet_official_model_checkp
                 'box_size': 27.27,
                 }
     gamdnet_official = SimpleMDNetNew(**param_dict).to(device)   
-    checkpoint = torch.load(gamdnet_official_model_checkpoint_filename)    
+    checkpoint = torch.load(gamdnet_official_model_checkpoint_filename, map_location='cuda:0')    
     
     state_dict_original = checkpoint['state_dict']
 
@@ -1112,6 +1112,71 @@ def regress_edge_message_equation(msg_force_dict):
         print(f"Best equation for edge message comp-{comp_id + 1} as a function of dx, dy, dz, and r:")
         print(best_equation)
 
+def regress_net_force_equation(msg_force_dict):
+    x = msg_force_dict['pos'][:, 0].cpu()
+    y = msg_force_dict['pos'][:, 1].cpu()
+    z = msg_force_dict['pos'][:, 2].cpu()    
+    
+    aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']    
+    agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
+    agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
+    agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
+    
+    agg_comp_1 = agg_msg_most_imp[:, -1].cpu() # the one with highest std
+    agg_comp_2 = agg_msg_most_imp[:, -2].cpu()
+    agg_comp_3 = agg_msg_most_imp[:, -3].cpu()
+
+    force_gt = msg_force_dict['net_force_gt'].cpu()    
+
+    print("Shapes: ", x.squeeze().shape, agg_comp_1.squeeze().shape, force_gt[:, 0].squeeze().shape)
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'x': x.squeeze(),
+        'y': y.squeeze(),
+        'z': z.squeeze(),        
+        'agg_comp_1': agg_comp_1.squeeze(),
+        'agg_comp_2': agg_comp_2.squeeze(),
+        'agg_comp_3': agg_comp_3.squeeze(),
+        'force_gt_comp_1': force_gt[:, 0].squeeze(),
+        'force_gt_comp_2': force_gt[:, 1].squeeze(),
+        'force_gt_comp_3': force_gt[:, 2].squeeze(),
+    })
+    
+    # Define the features and target variable
+    X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
+    
+    for comp_id in range(3):
+        y = data[f"force_gt_comp_{comp_id + 1}"].values
+        print(f"Fitting force_gt comp-{comp_id + 1} now....")
+        model = PySRRegressor(
+            niterations=1000,  # < Increase me for better results
+            model_selection="accuracy",
+            binary_operators=["+", "*", "-", "/", "^"],
+            unary_operators=[
+                "cos",
+                "exp",
+                "sin",
+                "inv(x) = 1/x",
+                # ^ Custom operator (julia syntax)
+            ],
+            extra_sympy_mappings={"inv": lambda x: 1 / x},
+            # ^ Define operator for SymPy as well
+            elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+            # ^ Custom loss function (julia syntax)
+        )    
+        # Fit the model to the data
+        model.fit(X, y)
+        
+        # Get the best equation found by PySR
+        best_equation = model.get_best()
+        
+        print(f"Best equation for force gt comp-{comp_id + 1} as a function of x, y, z, and aggreggate edge messages is: ")
+        print(best_equation)
+
+
+    return
+
+
 
 def regress_node_embedding_equation(msg_force_dict):    
     x = msg_force_dict['pos'][:, 0].cpu()
@@ -1142,7 +1207,7 @@ def regress_node_embedding_equation(msg_force_dict):
     data = pd.DataFrame({
         'x': x.squeeze(),
         'y': y.squeeze(),
-        'd': z.squeeze(),        
+        'z': z.squeeze(),        
         'agg_comp_1': agg_comp_1.squeeze(),
         'agg_comp_2': agg_comp_2.squeeze(),
         'agg_comp_3': agg_comp_3.squeeze(),
@@ -1152,34 +1217,34 @@ def regress_node_embedding_equation(msg_force_dict):
     })
     
     # Define the features and target variable
-    X = data[['dx', 'dy', 'dz', 'r']].values
+    X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
     
-    for comp_id in range(3):
-        y = data[f"z{comp_id + 1}"].values
-        print(f"Fitting edge message comp-{comp_id + 1} now....")
+    for comp_id in range(k):
+        y = data[f"node_embed_comp_{comp_id + 1}"].values
+        print(f"Fitting node embedding comp-{comp_id + 1} now....")
         model = PySRRegressor(
-        niterations=1000,
-        model_selection="accuracy",
-        binary_operators=["-", "*", "/", "pow", "+"],        
-        unary_operators=[
-            "inv(x) = 1/x",
-            # ^ Custom operator (julia syntax)
-        ],      
-        extra_sympy_mappings={"inv": lambda x: 1 / x},
-        # ^ Define operator for SymPy as well
-        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-        # ^ Custom loss function (julia syntax)  
-        complexity_of_variables=2,
-        constraints={"pow": (-1, 1)},  
-        )
-    
+            niterations=1000,  # < Increase me for better results
+            model_selection="accuracy",
+            binary_operators=["+", "*", "-", "/", "^"],
+            unary_operators=[
+                "cos",
+                "exp",
+                "sin",
+                "inv(x) = 1/x",
+                # ^ Custom operator (julia syntax)
+            ],
+            extra_sympy_mappings={"inv": lambda x: 1 / x},
+            # ^ Define operator for SymPy as well
+            elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+            # ^ Custom loss function (julia syntax)
+        )    
         # Fit the model to the data
         model.fit(X, y)
         
         # Get the best equation found by PySR
         best_equation = model.get_best()
         
-        print(f"Best equation for edge message comp-{comp_id + 1} as a function of dx, dy, dz, and r:")
+        print(f"Best equation for node embedding comp-{comp_id + 1} as a function of x, y, z, and aggreggate edge messages is: ")
         print(best_equation)
 
 
@@ -1190,7 +1255,9 @@ def regress_node_embedding_equation(msg_force_dict):
 gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 #gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
 #gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
-gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
+#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message_node_embed.ckpt'
+gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_0.1_reg_message_node_embed.ckpt'
 md_filedir = '../top/'
 gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
 msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
@@ -1208,11 +1275,17 @@ are_edge_msgs_gt_potential_correlated(msg_force_dict)
 
 #plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
 #plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
+'''
+print("Visualizing sparsity of node embedding components...")
+plot_param_sparsity(msg_force_dict, "node_embeddings")
+'''
 
-#print("Visualizing sparsity of node embedding components...")
-#plot_param_sparsity(msg_force_dict, "node_embeddings")
 # REGRESS EQ-2
-regress_node_embedding_equation(msg_force_dict)
+#print("Finding equations for top-3 node embedding components...")
+#regress_node_embedding_equation(msg_force_dict)
+
+print("Finding equations for net force components...")
+regress_net_force_equation(msg_force_dict)
 
 '''
 # Run inference purely using SR
