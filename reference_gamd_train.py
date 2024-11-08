@@ -115,7 +115,7 @@ class ParticleNetLightning(pl.LightningModule):
         self.rotate_aug = args.rotate_aug
         self.data_dir = args.data_dir
         self.loss_fn = args.loss
-        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message', 'l1_message_node_embed']
+        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message', 'l1_message_node_embed', 'constrain_msg_stds']
 
     def load_training_stats(self, scaler_ckpt):
         if scaler_ckpt is not None:
@@ -250,7 +250,7 @@ class ParticleNetLightning(pl.LightningModule):
             full_kl = torch.mean(torch.exp(logvar) + mu**2 - logvar)/2.0
             loss = mae + full_kl
         elif self.loss_fn == 'l1_message_node_embed':
-            regularization = 1e-2
+            regularization = 1e-1
             m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
             normalized_l05 = torch.mean(torch.abs(m12))                                    
             message_regularization_term = regularization * normalized_l05            
@@ -263,6 +263,15 @@ class ParticleNetLightning(pl.LightningModule):
             
             loss = mae + message_regularization_term + node_embed_regularization_term                         
 
+        elif self.loss_fn == 'constrain_msg_stds':
+            mae = nn.L1Loss()(pred, gt)            
+            regularization = 1e-1
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            std_selected = torch.std(m12[:, :3], dim=0) # inductive bias for 3D force-field
+            mean_std_selected = torch.mean(std_selected)
+            std_remaining = torch.std(m12[:, 3:], dim=0)    
+            mean_std_remaining = torch.mean(std_remaining)
+            loss = mae + regularization * torch.pow((mean_std_remaining - mean_std_selected), 2.0)       
         else:
             loss = nn.MSELoss()(pred, gt)
 
