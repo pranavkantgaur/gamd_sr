@@ -1,206 +1,450 @@
-'''
-1. Load dataloader, force decoder model weights for GAMDNet
-2. In the training loop:
-    1. for each batch of pos, edge index list and force gt:
-        1. compute e1, e2, e3
-        2. compute n1, n2…nk
-        3. compute aggregate messages using e1, e2, e3
-        4. compute node embeddings tensor (128-D) using n1, n2 … nk
-        5. pass above inputs to https://github.com/BaratiLab/GAMD/blob/main/code/nn_module.py#L147
-        6. pass resulting node embeddings to force MLP to get force prediction
-        7. compute loss wrt. force gt
-'''
-import os
+import argparse
+import os, sys
+import joblib
+import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.preprocessing import StandardScaler
+from torch.optim.lr_scheduler import StepLR, ExponentialLR
 from torch.utils.data import DataLoader
-from monolithic_gamd_impl import MDDataset, custom_collate, evaluate, GAMDLoss
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+import jax
+import jax.numpy as jnp
+import cupy
 
-class MLP(nn.Module):
-    def __init__(self,
-                 in_feats,
-                 out_feats,
-                 hidden_dim=128,
-                 hidden_layer=3,
-                 activation_first=False,
-                 activation='relu',
-                 init_param=False):
-        super(MLP, self).__init__()
-        if activation == 'relu':
-            act_fn = nn.ReLU()
-        elif activation == 'leaky_relu':
-            act_fn = nn.LeakyReLU(0.2)
-        elif activation == 'sigmoid':
-            act_fn = nn.Sigmoid()
-        elif activation == 'tanh':
-            act_fn = nn.Tanh()
-        elif activation == 'elu':
-            act_fn = nn.ELU()
-        elif activation == 'gelu':
-            act_fn = nn.GELU()
-        elif activation == 'silu':
-            act_fn = nn.SiLU()
+sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
+from nn_module import SimpleMDNetNew
+from train_utils import LJDataNew
+from graph_utils import NeighborSearcher, graph_network_nbr_fn
+import time
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1" # just to test if it works w/o gpu
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+# for water box
+#CUTOFF_RADIUS = 7.5
+CUTOFF_RADIUS = 10.2
+BOX_SIZE = 27.27
+
+NUM_OF_ATOMS = 258
+
+# NUM_OF_ATOMS = 251 * 3  # tip4p
+# CUTOFF_RADIUS = 3.4
+
+LAMBDA1 = 100.
+LAMBDA2 = 1e-3
+
+
+def get_rotation_matrix():
+    """ Randomly rotate the point clouds to augument the dataset
+        rotation is per shape based along up direction
+        Input:
+          Nx3 array, original point clouds
+        Return:
+          Nx3 array, rotated point clouds
+    """
+    if np.random.uniform() < 0.3:
+        angles = np.random.randint(-2, 2, size=(3,)) * np.pi
+    else:
+        angles = [0., 0., 0.]
+    Rx = np.array([[1., 0, 0],
+                       [0, np.cos(angles[0]), -np.sin(angles[0])],
+                       [0, np.sin(angles[0]), np.cos(angles[0])]], dtype=np.float32)
+    Ry = np.array([[np.cos(angles[1]), 0, np.sin(angles[1])],
+                       [0, 1, 0],
+                       [-np.sin(angles[1]), 0, np.cos(angles[1])]], dtype=np.float32)
+    Rz = np.array([[np.cos(angles[2]), -np.sin(angles[2]), 0],
+                   [np.sin(angles[2]), np.cos(angles[2]), 0],
+                   [0, 0, 1]], dtype=np.float32)
+    rotation_matrix = np.matmul(Rz, np.matmul(Ry, Rx))
+
+    return rotation_matrix
+
+
+def center_positions(pos):
+    offset = np.mean(pos, axis=0)
+    return pos - offset, offset
+
+def build_model(args, ckpt=None):
+
+    param_dict = {
+                  'encoding_size': args.encoding_size,
+                  'out_feats': 3,
+                  'hidden_dim': args.hidden_dim,
+                  'edge_embedding_dim': args.edge_embedding_dim,
+                  'conv_layer': 4,
+                  'drop_edge': args.drop_edge,
+                  'use_layer_norm': args.use_layer_norm,
+                  'box_size': BOX_SIZE,
+                  }
+
+    print("Using following set of hyper-parameters")
+    print(param_dict)
+    model = SimpleMDNetNew(**param_dict)
+
+    if ckpt is not None:
+        print('Loading model weights from: ', ckpt)
+        model.load_state_dict((torch.load(ckpt)))
+    return model
+
+
+class ParticleNetLightning(pl.LightningModule):
+    def __init__(self, args, num_device=1, epoch_num=100, batch_size=1, learning_rate=3e-4, log_freq=1000,
+                 model_weights_ckpt=None, scaler_ckpt=None):
+        super(ParticleNetLightning, self).__init__()
+        self.pnet_model = build_model(args, model_weights_ckpt)
+        self.epoch_num = epoch_num
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.num_device = num_device
+        self.log_freq = log_freq
+        self.train_data_scaler = StandardScaler()
+        self.training_mean = np.array([0.])
+        self.training_var = np.array([1.])
+
+        if scaler_ckpt is not None:
+            self.load_training_stats(scaler_ckpt)
+
+        self.cutoff = CUTOFF_RADIUS
+        self.nbr_searcher = NeighborSearcher(BOX_SIZE, self.cutoff)
+        self.nbrlst_to_edge_mask = jax.jit(graph_network_nbr_fn(self.nbr_searcher.displacement_fn,
+                                                                    self.cutoff,
+                                                                    NUM_OF_ATOMS))
+        self.nbr_cache = {}
+        self.rotate_aug = args.rotate_aug
+        self.data_dir = args.data_dir
+        self.loss_fn = args.loss
+        assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message', 'l1_message_node_embed', 'constrain_msg_stds']
+
+    def load_training_stats(self, scaler_ckpt):
+        if scaler_ckpt is not None:
+            scaler_info = np.load(scaler_ckpt)
+            self.training_mean = scaler_info['mean']
+            self.training_var = scaler_info['var']
+
+    def forward(self, pos, feat, edge_idx_tsr):
+        return self.denormalize(self.pnet_model(pos, feat, edge_idx_tsr.long()), self.training_var, self.training_mean)
+
+    def denormalize(self, normalized_force, var, mean):
+        return normalized_force * \
+                np.sqrt(var) +\
+                mean
+
+    def predict_forces(self, pos: np.ndarray, verbose=False):
+        nbr_start = time.time()
+        edge_idx_tsr = self.search_for_neighbor(pos,
+                                                self.nbr_searcher,
+                                                self.nbrlst_to_edge_mask,
+                                                'all')
+        nbr_end = time.time()
+        # enforce periodic boundary
+        pos = np.mod(pos, np.array(BOX_SIZE))
+        pos = torch.from_numpy(pos).float().cuda()
+        force_start = time.time()
+        pred = self.pnet_model([pos],
+                               [edge_idx_tsr],
+                               )
+        force_end = time.time()
+        if verbose:
+            print('=============================================')
+            print(f'Nbr search used time: {nbr_end - nbr_start}')
+            print(f'Force eval used time: {force_end - force_start}')
+
+        pred = pred.detach().cpu().numpy()
+
+        pred = self.denormalize(pred, self.training_var, self.training_mean)
+
+        return pred
+
+    def scale_force(self, force, scaler):
+        b_pnum, dims = force.shape
+        force_flat = force.reshape((-1, 1))
+        scaler.partial_fit(force_flat)
+        force = torch.from_numpy(scaler.transform(force_flat)).float().view(b_pnum, dims)
+        return force
+
+    def get_edge_idx(self, nbrs, pos_jax, mask):
+        dummy_center_idx = nbrs.idx.copy()
+        #dummy_center_idx = jax.ops.index_update(dummy_center_idx, None,
+        #                                        jnp.arange(pos_jax.shape[0]).reshape(-1, 1))
+        dummy_center_idx = dummy_center_idx.at[:].set(jnp.arange(pos_jax.shape[0]).reshape(-1, 1))
+        center_idx = dummy_center_idx.reshape(-1)
+        center_idx_ = cupy.asarray(center_idx)
+        center_idx_tsr = torch.as_tensor(center_idx_, device='cuda')
+
+        neigh_idx = nbrs.idx.reshape(-1)
+
+        # cast jax device array to cupy array so that it can be transferred to torch
+        neigh_idx = cupy.asarray(neigh_idx)
+        mask = cupy.asarray(mask)
+        mask = torch.as_tensor(mask, device='cuda')
+        flat_mask = mask.view(-1)
+        neigh_idx_tsr = torch.as_tensor(neigh_idx, device='cuda')
+
+        edge_idx_tsr = torch.cat((center_idx_tsr[flat_mask].view(1, -1), neigh_idx_tsr[flat_mask].view(1, -1)),
+                                 dim=0)
+        return edge_idx_tsr
+
+    def search_for_neighbor(self, pos, nbr_searcher, masking_fn, type_name):
+        pos_jax = jax.device_put(pos, jax.devices("gpu")[1])
+
+        if not nbr_searcher.has_been_init:
+            nbrs = nbr_searcher.init_new_neighbor_lst(pos_jax)
+            self.nbr_cache[type_name] = nbrs
         else:
-            raise Exception('Only support: relu, leaky_relu, sigmoid, tanh, elu, as non-linear activation')
+            nbrs = nbr_searcher.update_neighbor_lst(pos_jax, self.nbr_cache[type_name])
+            self.nbr_cache[type_name] = nbrs
 
-        mlp_layer = []
-        for l in range(hidden_layer):
-            if l != hidden_layer-1 and l != 0:
-                mlp_layer += [nn.Linear(hidden_dim, hidden_dim), act_fn]
-            elif l == 0:
-                if hidden_layer == 1:
-                    if activation_first:
-                        mlp_layer += [act_fn, nn.Linear(in_feats, out_feats)]
-                    else:
-                        print('Using MLP with no hidden layer and activations! Fall back to nn.Linear()')
-                        mlp_layer += [nn.Linear(in_feats, out_feats)]
-                elif not activation_first:
-                    mlp_layer += [nn.Linear(in_feats, hidden_dim), act_fn]
-                else:
-                    mlp_layer += [act_fn, nn.Linear(in_feats, hidden_dim), act_fn]
-            else:   # l == hidden_layer-1
-                mlp_layer += [nn.Linear(hidden_dim, out_feats)]
-        self.mlp_layer = nn.Sequential(*mlp_layer)
-        if init_param:
-            self._init_parameters()
+        edge_mask_all = masking_fn(pos_jax, nbrs.idx)
+        edge_idx_tsr = self.get_edge_idx(nbrs, pos_jax, edge_mask_all)
+        return edge_idx_tsr.long()
 
-    def _init_parameters(self):
-        for layer in self.mlp_layer:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
+    def training_step(self, batch, batch_nb):
+        pos_lst = batch['pos']
+        gt_lst = batch['forces']
+        edge_idx_lst = []
+        for b in range(len(gt_lst)):
+            pos, gt = pos_lst[b], gt_lst[b]
 
-    def forward(self, feat):
-        return self.mlp_layer(feat.to('cuda:2'))
+            if self.rotate_aug:
+                pos = np.mod(pos, BOX_SIZE)
+                pos, off = center_positions(pos)
+                R = get_rotation_matrix()
+                pos = np.matmul(pos, R)
+                pos += off
+                gt = np.matmul(gt, R)
 
-def init_dataloader_and_models(train_data_fraction, avg_num_neighbors, rotation_aug, return_train_data,
-    num_input_files, batch_size, lambda_reg, md_filedir, in_node_feats, hidden_dim, out_node_feats, activation, 
-    encoding_size, out_feats):
-    print("Loading input files: ", num_input_files)
-    dataset = MDDataset(md_filedir, rotation_aug, avg_num_neighbors, train_data_fraction, return_train_data) 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)
-    print("Dataloader initialized.")   
+            pos = np.mod(pos, BOX_SIZE)
 
-    phi_dst = nn.Linear(3, hidden_dim) # input size matches the dimensionality of problem.
-    phi_edge = nn.Linear(3, hidden_dim)
-    phi = MLP(hidden_dim, out_node_feats,
-                    activation_first=True, hidden_layer=1, hidden_dim=hidden_dim, activation=activation)
+            gt = self.scale_force(gt, self.train_data_scaler).cuda()
+            pos_lst[b] = torch.from_numpy(pos).float().cuda()
+            gt_lst[b] = gt
 
-    force_decoder = MLP(encoding_size, out_feats, hidden_layer=2, hidden_dim=hidden_dim, activation='gelu')
-    srgnn_loss = GAMDLoss(lambda_reg)
-    return dataloader, srgnn_loss, phi, phi_dst, phi_edge, force_decoder
+            edge_idx_tsr = self.search_for_neighbor(pos,
+                                                    self.nbr_searcher,
+                                                    self.nbrlst_to_edge_mask,
+                                                    'all')
+            edge_idx_lst += [edge_idx_tsr]
+        gt = torch.cat(gt_lst, dim=0)
+        pos_lst = [pos + torch.randn_like(pos) * 0.005 for pos in pos_lst]
 
-def inv(x):
-    try:
-        return torch.reciprocal(x + 1e-2)
-    except:
-        print("Divide by 0, please fix")
-        exit(0) 
+        pred = self.pnet_model(pos_lst,
+                               edge_idx_lst,
+                               )
 
-def sin(x):
-    return torch.sin(torch.tensor(x))
+        if self.loss_fn == 'mae':
+            loss = nn.L1Loss()(pred, gt)
+        elif self.loss_fn == 'l1_message':
+            regularization = 1e-2
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            normalized_l05 = torch.mean(torch.abs(m12))
+            mae = nn.L1Loss()(pred, gt)                        
+            message_regularization_term = regularization * normalized_l05
+            loss = mae + message_regularization_term             
+        elif self.loss_fn == 'kl_message':
+            mae = nn.L1Loss()(pred, gt)            
+            raw_msg = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            mu = raw_msg[:, 0::2]
+            logvar = raw_msg[:, 1::2]
+            full_kl = torch.mean(torch.exp(logvar) + mu**2 - logvar)/2.0
+            loss = mae + full_kl
+        elif self.loss_fn == 'l1_message_node_embed':
+            regularization = 1e-1
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            normalized_l05 = torch.mean(torch.abs(m12))                                    
+            message_regularization_term = regularization * normalized_l05            
+            
+            n12 = self.pnet_model.graph_conv.conv[-1].input_node_embeddings
+            normalized_n05 = torch.mean(torch.abs(n12))
+            node_embed_regularization_term = regularization * normalized_n05
+            
+            mae = nn.L1Loss()(pred, gt)
+            
+            loss = mae + message_regularization_term + node_embed_regularization_term                         
 
-def exp(x):
-    return torch.exp(torch.tensor(x))
+        elif self.loss_fn == 'constrain_msg_stds':
+            mae = nn.L1Loss()(pred, gt)            
+            regularization = 1e-1
+            m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
+            std_remaining_abs = torch.abs(torch.std(m12[:, 3:], dim=0))    
+            mean_std_remaining_abs = torch.mean(std_remaining_abs)
+            loss = mae + regularization * mean_std_remaining_abs # inductive bias to push all info to first 3 message components.       
+        else:
+            loss = nn.MSELoss()(pred, gt)
 
-def cos(x):
-    return torch.cos(torch.tensor(x))
+        #conservative_loss = (torch.mean(pred)).abs()
+        #loss = loss + LAMBDA2 * conservative_loss
 
-# SR-MLP model inference
-def forward(pos, edge_index_list): 
-    center_node_index = edge_index_list[0, :]
-    neighbor_node_index = edge_index_list[1, :]
-    
-    dx = pos[neighbor_node_index, 0] - pos[center_node_index, 0]
-    dy = pos[neighbor_node_index, 1] - pos[center_node_index, 1]
-    dz = pos[neighbor_node_index, 2] - pos[center_node_index, 2]
+        self.training_mean = self.train_data_scaler.mean_
+        self.training_var = self.train_data_scaler.var_
 
-    # Calculate the distance vector
-    center_node_pos = pos[center_node_index]
-    neighbor_node_pos = pos[neighbor_node_index]
-    r_vec = neighbor_node_pos - center_node_pos
-    
-    # Calculate the distance (magnitude)
-    r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
-    pos_x = pos[:, 0]
-    pos_y = pos[:, 1]
-    pos_z = pos[:, 2]   
+        self.log('total loss', loss, on_step=True, prog_bar=True, logger=True)
+        self.log(f'{self.loss_fn} loss', loss, on_step=True, prog_bar=True, logger=True)
+        self.log('var', torch.tensor(np.sqrt(self.training_var)), on_step=True, prog_bar=True, logger=True)
 
-    # create edge messages tensor using eq. from SR
-    e1 = (0.2722 * (((inv(dx - 1.6381) + (0.35378 / dx)) * -1.9265e-05) / 0.55934)) / r
-    e2 = 0.77933 * (((-9.2687e-06 / r) / ((dx + -1.2794) - dz)) / (-0.57706 + dz)) 
-    e3 = inv(r) * ((inv(inv(inv(-1.2083))) - dy) * (8.9686e-07 / (dz - 0.57655)))
-    edge_messages = torch.cat((e1, e2), axis = 1)
-    edge_messages = torch.cat((edge_messages, e3), axis = 1)
+        return loss
+
+    def configure_optimizers(self):
+        optim = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        sched = StepLR(optim, step_size=5, gamma=0.001**(5/self.epoch_num))
+        return [optim], [sched]
+
+    def train_dataloader(self):
+        dataset = LJDataNew(dataset_path=os.path.join(self.data_dir, ''),
+                               sample_num=1000,
+                               case_prefix='ljdata_',
+                               seed_num=10,
+                               mode='train')
+
+        return DataLoader(dataset, num_workers=2, batch_size=self.batch_size, shuffle=True,
+                          collate_fn=
+                          lambda batches: {
+                              'pos': [batch['pos'] for batch in batches],
+                              'forces': [batch['forces'] for batch in batches],
+                          })
+
+    def val_dataloader(self):
+        dataset = LJDataNew(dataset_path=os.path.join(self.data_dir, ''),
+                               sample_num=1000,
+                               case_prefix='ljdata_',
+                               seed_num=10,
+                               mode='test')
+
+        return DataLoader(dataset, num_workers=2, batch_size=16, shuffle=False,
+                          collate_fn=
+                          lambda batches: {
+                              'pos': [batch['pos'] for batch in batches],
+                              'forces': [batch['forces'] for batch in batches],
+                          })
+
+    def validation_step(self, batch, batch_nb):
+        with torch.no_grad():
+
+            pos_lst = batch['pos']
+            gt_lst = batch['forces']
+            edge_idx_lst = []
+            for b in range(len(gt_lst)):
+                pos, gt = pos_lst[b], gt_lst[b]
+                pos = np.mod(pos, BOX_SIZE)
+
+                gt = self.scale_force(gt, self.train_data_scaler).cuda()
+                pos_lst[b] = torch.from_numpy(pos).float().cuda()
+                gt_lst[b] = gt
+
+                edge_idx_tsr = self.search_for_neighbor(pos,
+                                                        self.nbr_searcher,
+                                                        self.nbrlst_to_edge_mask,
+                                                        'all')
+                edge_idx_lst += [edge_idx_tsr]
+            gt = torch.cat(gt_lst, dim=0)
+
+            pred = self.pnet_model(pos_lst,
+                                   edge_idx_lst,
+                                   )
+            ratio = torch.sqrt((pred.reshape(-1) - gt.reshape(-1)) ** 2) / (torch.abs(pred.reshape(-1)) + 1e-8)
+            outlier_ratio = ratio[ratio > 10.].shape[0] / ratio.shape[0]
+            mse = nn.MSELoss()(pred, gt)
+            mae = nn.L1Loss()(pred, gt)
+
+            batch_size = len(gt_lst)
+            self.log('val outlier', outlier_ratio, prog_bar=True, logger=True, batch_size = batch_size)
+            self.log('val mse', mse, prog_bar=True, logger=True, batch_size = batch_size)
+            self.log('val mae', mae, prog_bar=True, logger=True, batch_size = batch_size)
 
 
-    aggregate_edge_messages = torch.zeros((pos.shape[0], edge_messages.shape[1]), dtype=torch.float32)
-    aggregate_edge_messages.index_add_(0, center_node_index, edge_messages)  # Accumulate messages into AGG    
-    
-    
-    agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
-    agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
-    agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
-    
-    agg_comp_1 = agg_msg_most_imp[:, -1]
-    agg_comp_2 = agg_msg_most_imp[:, -2]
-    agg_comp_3 = agg_msg_most_imp[:, -3]
+class ModelCheckpointAtEpochEnd(pl.Callback):
+    """
+       Save a checkpoint at epoch end
+    """
+    def __init__(
+            self,
+            filepath,
+            save_step_frequency,
+            prefix="checkpoint",
+    ):
+        """
+        Args:
+            save_step_frequency: how often to save in steps
+            prefix: add a prefix to the name, only used if
+        """
+        self.filepath = filepath
+        self.save_step_frequency = save_step_frequency
+        self.prefix = prefix
 
-    # create node embeddings tensor using eq. from SR
-    n1 = (1.0566 / ((3.435 / agg_comp_2) - ((inv(-0.78501 + agg_comp_3) + sin(sin(-0.78501) * pos_y)) - 0.47231))) - -0.0053185
-    n2 = (((-0.067859 * sin(0.28926 * pos_z)) - agg_comp_1) / (sin(inv(sin(agg_comp_1)) - -0.76162) + exp(1.4285))) / 1.1111
-    n3 = sin(sin(agg_comp_3 / ((-3.9187 + (cos(sin(inv(agg_comp_3))) / pos_y)) - ((agg_comp_2 + agg_comp_3) * (1.38 + agg_comp_2))))) 
-    
-    print('HSAPES: ', n1.shape, n2.shape, n3.shape, e1.shape, e2.shape, e3.shape)
+    def on_epoch_end(self, trainer: pl.Trainer, pl_module: ParticleNetLightning):
+        """ Check if we should save a checkpoint after every train batch """
+        epoch = trainer.current_epoch        
+        if epoch % self.save_step_frequency == 0 or epoch == pl_module.epoch_num -1:
+            filename = os.path.join(self.filepath, f"{self.prefix}_{epoch}.ckpt")
+            scaler_filename = os.path.join(self.filepath, f"scaler_{epoch}.npz")
 
-    node_embeddings = torch.cat((n1, n2), axis = 1)
-    node_embeddings = torch.cat((node_embeddings, n3), axis = 1)
-
-    node_feat = phi(phi_dst(node_embeddings) + phi_edge(aggregate_edge_messages)) # So, we need to predict edge_emb (aggrgated edge messages), h (input node embeddings) inputs for the last message passing layer using SR to effecitively couple SR with the remaining GNN.  
-    force_pred = force_decoder(node_feat)    
-    
-    return force_pred
-
-
+            ckpt_path = os.path.join(trainer.checkpoint_callback.dirpath, filename)
+            trainer.save_checkpoint(ckpt_path)
+            np.savez(scaler_filename,
+                     mean=pl_module.training_mean,
+                     var=pl_module.training_var,
+                     )
+            # joblib.dump(pl_module.train_data_scaler, scaler_filename)
 
 
+def train_model(args):
+    lr = args.lr
+    num_gpu = args.num_gpu
+    check_point_dir = args.cp_dir
+    min_epoch = args.min_epoch
+    max_epoch = args.max_epoch
+    weight_ckpt = args.state_ckpt_dir
+    batch_size = args.batch_size
 
-######################################## Control script #####################################################
-train_data_fraction = 1.0 # select 9k for training
-avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
-rotation_aug = False # online rotation augmentation for a frame    
-# create train data-loader
-return_train_data = True
-md_filedir = '../top/'
-num_input_files = 10#len(os.listdir(md_filedir))
-batch_size = 1 
-encoding_size = 128
-out_feats = 3
-hidden_dim = 128
-lambda_reg = 1e-2
-activation = 'silu'
-in_node_feats = 3
-out_node_feats = 128
+    model = ParticleNetLightning(epoch_num=max_epoch,
+                                 num_device=num_gpu if num_gpu != -1 else 1,
+                                 learning_rate=lr,
+                                 model_weights_ckpt=weight_ckpt,
+                                 batch_size=batch_size,
+                                 args=args)
+    cwd = os.getcwd()
+    model_check_point_dir = os.path.join(cwd, check_point_dir)
+    os.makedirs(model_check_point_dir, exist_ok=True)
+    print("Checkpoints will be saved at: ", model_check_point_dir)
+    epoch_end_callback = ModelCheckpointAtEpochEnd(filepath=model_check_point_dir, save_step_frequency=1)
+    checkpoint_callback = pl.callbacks.ModelCheckpoint()
 
-dataloader, srgnn_loss, phi, phi_dst, phi_edge, force_decoder = init_dataloader_and_models(train_data_fraction, 
-avg_num_neighbors, rotation_aug, return_train_data, num_input_files, batch_size, lambda_reg, md_filedir, in_node_feats,
-hidden_dim, out_node_feats, activation, encoding_size, out_feats)
+    trainer = Trainer(
+        devices=[1],#num_gpu,  # Use 'devices' instead of 'gpus'
+        accelerator='gpu',  # Specify the accelerator as 'gpu'
+        callbacks=[epoch_end_callback, checkpoint_callback],
+        min_epochs=min_epoch,
+        max_epochs=max_epoch,
+        precision=16,  # Use 'precision' for mixed precision if needed
+        benchmark=True,
+        strategy='ddp',  # Use 'strategy' for distributed training
+        default_root_dir='/home/pranav/gamd_sr/official/GAMD-main/code/LJ/model_ckpt'
+    )
+    trainer.fit(model)
 
-sr_loss = srgnn_loss.to('cpu')
-phi = phi.to('cpu')
-phi_dst = phi_dst.to('cpu')
-phi_edge = phi_edge.to('cpu')
-force_decoder = force_decoder.to('cpu')
 
-n_epochs = 100
-# train model
-for epoch_id in range(n_epochs):
-    for iter_id, (pos, edge_index_list, force_gt) in enumerate(dataloader):
-        pos = pos.to('cpu')
-        edge_index_list = edge_index_list.to('cpu')
-        force_pred = forward(pos, edge_index_list)
-        loss = sr_loss(force_pred, force_gt)
-        print("Loss value: ", loss.item())
-        loss.backward()
-        if iter_id % 100 == 0:
-            evaluate(force_gt, force_pred)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_epoch', default=30, type=int)
+    parser.add_argument('--max_epoch', default=30, type=int)
+    parser.add_argument('--lr', default=3e-4, type=float)
+    parser.add_argument('--cp_dir', default='model_ckpt')
+    parser.add_argument('--state_ckpt_dir', default=None, type=str)
+    parser.add_argument('--batch_size', default=1, type=int)
+    parser.add_argument('--encoding_size', default=256, type=int)
+    parser.add_argument('--hidden_dim', default=128, type=int)
+    parser.add_argument('--edge_embedding_dim', default=256, type=int)
+    parser.add_argument('--drop_edge', action='store_true')
+    parser.add_argument('--use_layer_norm', action='store_true')
+    parser.add_argument('--disable_rotate_aug', dest='rotate_aug', default=True, action='store_false')
+    parser.add_argument('--data_dir', default='./md_dataset')
+    parser.add_argument('--loss', default='mae')
+    parser.add_argument('--num_gpu', default=-1, type=int)
+    args = parser.parse_args()
+    train_model(args)
+
+
+if __name__ == '__main__':
+    main()
 
