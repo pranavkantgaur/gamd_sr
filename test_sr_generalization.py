@@ -7,9 +7,17 @@
 
 from monolithic_gamd_impl import evaluate, custom_collate, MDDataset
 from sr_over_gnn_messages import SimpleMDNetNew
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import pandas as pd
+
+# check for CUDA device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device is: ", device)
 
 def load_id_dataset():
-    data_dir = "./id_dataset/" # [10000, [[258, 3], [258, 3], [258, 3]]]
+    data_dir = '../top/'#"./id_dataset/" # [10000, [[258, 3], [258, 3], [258, 3]]]
     train_data_fraction = 0.9 # select 9k for training
     avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
     rotation_aug = False # online rotation augmentation for a frame
@@ -22,7 +30,7 @@ def load_id_dataset():
     return id_dataloader
 
 def load_ood_dataset():
-    data_dir = "./ood_dataset/" # [10000, [[258, 3], [258, 3], [258, 3]]]
+    data_dir = '../top/' #"./ood_dataset/" # [10000, [[258, 3], [258, 3], [258, 3]]]
     train_data_fraction = 0.9 # select 9k for training
     avg_num_neighbors = 20 # criteria for connectivity of atoms for any frame
     rotation_aug = False # online rotation augmentation for a frame
@@ -46,7 +54,7 @@ def load_gnn():
                 'use_layer_norm': True,
                 'box_size': 27.27,
                 }
-    gamd_model_weights_filename = 'epoch=39-step=360000_edge_msg_constrained_std.ckpt'
+    gamdnet_official_model_checkpoint_filename = 'epoch=39-step=360000_edge_msg_constrained_std.ckpt'
     gamdnet_official = SimpleMDNetNew(**param_dict).to(device)   
     checkpoint = torch.load(gamdnet_official_model_checkpoint_filename, map_location='cuda:0')    
     
@@ -71,9 +79,9 @@ def load_gnn():
 
 
 class SRModel(object):
-    def __init__(self, msg_models, force_models):
+    def __init__(self, msg_models, netforce_models):
         self.msg_models = msg_models
-        self.force_models = force_models
+        self.netforce_models = netforce_models
     
     def predict(self, pos, edge_index_list):
 
@@ -90,23 +98,22 @@ class SRModel(object):
         dz = r_vec[:, 2]
         # Create a DataFrame for easier handling of data
         data = pd.DataFrame({
-            'dx': dx.squeeze(),
-            'dy': dy.squeeze(),
-            'dz': dz.squeeze(),
-            'r': r.squeeze(),
+            'dx': dx.squeeze().cpu(),
+            'dy': dy.squeeze().cpu(),
+            'dz': dz.squeeze().cpu(),
+            'r': r.squeeze().cpu(),
         })        
         # Define the features
         X = data[['dx', 'dy', 'dz', 'r']].values
-        e1 = self.msg_models[0].predict(X)
-        e2 = self.msg_models[1].predict(X)
-        e3 = self.msg_models[2].predict(X)
-
-        edge_messages = torch.cat((e1, e2), axis = 1)
-        edge_messages = torch.cat((edge_messages, e3), axis = 1)
+        e1 = torch.Tensor(self.msg_models[0].predict(X)).squeeze()
+        e2 = torch.Tensor(self.msg_models[1].predict(X)).squeeze()
+        e3 = torch.Tensor(self.msg_models[2].predict(X)).squeeze()
+  
+        edge_messages = torch.stack((e1, e2, e3), dim=1)
 
 
         aggregate_edge_messages = torch.zeros((pos.shape[0], edge_messages.shape[1]), dtype=torch.float32)
-        aggregate_edge_messages.index_add_(0, center_node_index, edge_messages)  # Accumulate messages into AGG    
+        aggregate_edge_messages.index_add_(0, center_node_idx.cpu(), edge_messages)  # Accumulate messages into AGG    
         
         
         agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
@@ -133,13 +140,11 @@ class SRModel(object):
         # Define the features
         X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values       
 
-        f1 = self.force_models[0].predict(X)
-        f2 = self.force_models[1].predict(X)
-        f3 = self.force_models[2].predict(X)
+        f1 = self.netforce_models[0].predict(X)
+        f2 = self.netforce_models[1].predict(X)
+        f3 = self.netforce_models[2].predict(X)
         
-        force_pred_sr = torch.cat((f1, f2), dim = 1)
-        force_pred_sr = torch.cat((force_pred_sr, f3), dim=1)
-
+        force_pred_sr = torch.stack((f1, f2, f3), dim=1)
         return force_pred_sr
 
 
@@ -148,16 +153,16 @@ def load_sr():
     import pickle
     # Load the model from the file
     sr_msg_models = []
-    sr_force_models = []
+    sr_netforce_models = []
     for comp_id in range(3): # 1 model file per component
-        model_filename = 'pysr_model_msg_' + comp_id + '_pred.pkl'
+        model_filename = f"pysr_model_msg_{comp_id}_pred.pkl"
         with open(model_filename, 'rb') as file:
             sr_msg_models.append(pickle.load(file))    
-        model_filename = 'pysr_model_force_' + comp_id + '_pred.pkl'
+        model_filename = f"pysr_model_netforce_{comp_id}_pred.pkl"
         with open(model_filename, 'rb') as file:
-            sr_force_models.append(pickle.load(file))                
+            sr_netforce_models.append(pickle.load(file))                
     
-    sr_model = SRModel(sr_msg_models, sr_force_models)
+    sr_model = SRModel(sr_msg_models, sr_netforce_models)
     return sr_model
 
 
@@ -168,11 +173,28 @@ ood_dataloader = load_ood_dataset()
 gnn_model = load_gnn()
 sr_model = load_sr()
 
+
+print("Testing in-domain generalization performance...")
 for pos, edge_index_list, force_gt in id_dataloader:
-    force_pred_gnn = gnn_model(pos, edge_index_list)
-    force_pred_sr = sr_model.predict(pos, edge_index_list)
+    print("GNN performance: ")
+    force_pred_gnn = gnn_model([pos],
+                               [edge_index_list])
     evaluate(force_pred_gnn, force_gt)
+    print("SR perfomance: ")
+    force_pred_sr = sr_model.predict(pos, edge_index_list)    
     evaluate(force_pred_sr, force_gt)
     break
+
+
+print("Testing out of domain generalization performance...")
+for pos, edge_index_list, force_gt in ood_dataloader:
+    print("GNN performance: ")    
+    force_pred_gnn = gnn_model([pos],
+                               [edge_index_list])
+    evaluate(force_pred_gnn, force_gt)                               
+    print("SR perfomance: ")
+    force_pred_sr = sr_model.predict(pos, edge_index_list)    
+    evaluate(force_pred_sr, force_gt)
+    break    
 
 
