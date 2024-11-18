@@ -89,6 +89,24 @@ class SRModel(object):
         neigh_node_idx = edge_index_list[1, :]
         neigh_node_pos = pos[neigh_node_idx]
         center_node_pos = pos[center_node_idx]
+
+        # Identify edges where center and neighbor nodes are the same
+        same_index_columns = (center_node_idx == neigh_node_idx)
+        # Get the self-loop edge indices
+        self_loop_indices = edge_index_list[:, same_index_columns]
+
+        # Print the self-loop edge indices
+        print("Self-loop Edge Indices:\n", self_loop_indices)
+
+        #exit(0)
+
+        # Remove edges where center and neighbor nodes are the same
+        center_node_pos = center_node_pos[~same_index_columns]
+        neigh_node_pos = neigh_node_pos[~same_index_columns]
+
+        center_node_idx = center_node_idx[~same_index_columns]
+        neigh_node_idx = neigh_node_idx[~same_index_columns]
+
         # Calculate the distance vector
         r_vec = neigh_node_pos - center_node_pos  # Shape: [n, 3]        
         # Calculate the distance (magnitude)
@@ -140,11 +158,11 @@ class SRModel(object):
         # Define the features
         X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values       
 
-        f1 = self.netforce_models[0].predict(X)
-        f2 = self.netforce_models[1].predict(X)
-        f3 = self.netforce_models[2].predict(X)
+        f1 = torch.Tensor(self.netforce_models[0].predict(X)).squeeze()
+        f2 = torch.Tensor(self.netforce_models[1].predict(X)).squeeze()
+        f3 = torch.Tensor(self.netforce_models[2].predict(X)).squeeze()
         
-        force_pred_sr = torch.stack((f1, f2, f3), dim=1)
+        force_pred_sr = torch.stack((f1, f2, f3), dim=1).cuda()
         return force_pred_sr
 
 
