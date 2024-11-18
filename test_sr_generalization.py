@@ -71,51 +71,95 @@ def load_gnn():
 
 
 class SRModel(object):
-    def __init__(self, msg_model, force_model):
-        self.msg_model = msg_model
-        self.force_model = force_model
+    def __init__(self, msg_models, force_models):
+        self.msg_models = msg_models
+        self.force_models = force_models
     
-    def predict(pos, edge_index_list):
-        dx = 
-        dy = 
-        dz = 
-        r = 
-        X = pd.DataFrame('dx': dx, 'dy': dy, 'dz': dz, 'r': r)
-        e1 = self.msg_comp_1_model.predict(X)
-        e2 = self.msg_comp_2_model.predict(X)
-        e3 = self.msg_comp_3_model.predict(X)
+    def predict(self, pos, edge_index_list):
 
+        center_node_idx = edge_index_list[0, :]
+        neigh_node_idx = edge_index_list[1, :]
+        neigh_node_pos = pos[neigh_node_idx]
+        center_node_pos = pos[center_node_idx]
+        # Calculate the distance vector
+        r_vec = neigh_node_pos - center_node_pos  # Shape: [n, 3]        
+        # Calculate the distance (magnitude)
+        r = torch.norm(r_vec, dim=1).unsqueeze(1)  # Shape: [n, 1]
+        dx = r_vec[:, 0]
+        dy = r_vec[:, 1]
+        dz = r_vec[:, 2]
+        # Create a DataFrame for easier handling of data
+        data = pd.DataFrame({
+            'dx': dx.squeeze(),
+            'dy': dy.squeeze(),
+            'dz': dz.squeeze(),
+            'r': r.squeeze(),
+        })        
+        # Define the features
+        X = data[['dx', 'dy', 'dz', 'r']].values
+        e1 = self.msg_models[0].predict(X)
+        e2 = self.msg_models[1].predict(X)
+        e3 = self.msg_models[2].predict(X)
+
+        edge_messages = torch.cat((e1, e2), axis = 1)
+        edge_messages = torch.cat((edge_messages, e3), axis = 1)
+
+
+        aggregate_edge_messages = torch.zeros((pos.shape[0], edge_messages.shape[1]), dtype=torch.float32)
+        aggregate_edge_messages.index_add_(0, center_node_index, edge_messages)  # Accumulate messages into AGG    
         
-        agg_comp_1, agg_comp_2, agg_comp_3 = compute_aggregate_msgs(e1, e2, e3)
-        pos_X = 
-        pos_Y = 
-        pos_Z = 
         
-        X = pd.DataFrame('pos_X': , 'pos_Y': , 'pos_Z': , 'agg_comp_1: ', 'agg_comp_2': , 'agg_comp_3': )
+        agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
+        agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
+        agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
         
-        f1 = self.force_comp_1_model.predict(X)
-        f2 = self.force_comp_2_model.predict(X)
-        f3 = self.force_comp_3_model.predict(X)
+        agg_comp_1 = agg_msg_most_imp[:, -1]
+        agg_comp_2 = agg_msg_most_imp[:, -2]
+        agg_comp_3 = agg_msg_most_imp[:, -3]
+
+        x = pos[:, 0].cpu()
+        y = pos[:, 1].cpu()
+        z = pos[:, 2].cpu()    
+
+        data = pd.DataFrame({
+            'x': x.squeeze(),
+            'y': y.squeeze(),
+            'z': z.squeeze(),        
+            'agg_comp_1': agg_comp_1.squeeze(),
+            'agg_comp_2': agg_comp_2.squeeze(),
+            'agg_comp_3': agg_comp_3.squeeze(),
+        })
+        
+        # Define the features
+        X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values       
+
+        f1 = self.force_models[0].predict(X)
+        f2 = self.force_models[1].predict(X)
+        f3 = self.force_models[2].predict(X)
         
         force_pred_sr = torch.cat((f1, f2), dim = 1)
         force_pred_sr = torch.cat((force_pred_sr, f3), dim=1)
+
         return force_pred_sr
+
+
 
 def load_sr():
     import pickle
     # Load the model from the file
-    with open('pysr_model_msg_pred.pkl', 'rb') as file:
-        sr_model_msg_pred = pickle.load(file)    
-    with open('pysr_model_msg_pred.pkl', 'rb') as file:
-        sr_model_msg_pred = pickle.load(file)        
+    sr_msg_models = []
+    sr_force_models = []
+    for comp_id in range(3): # 1 model file per component
+        model_filename = 'pysr_model_msg_' + comp_id + '_pred.pkl'
+        with open(model_filename, 'rb') as file:
+            sr_msg_models.append(pickle.load(file))    
+        model_filename = 'pysr_model_force_' + comp_id + '_pred.pkl'
+        with open(model_filename, 'rb') as file:
+            sr_force_models.append(pickle.load(file))                
     
-     
-    
-    sr_model = SRModel(sr_model_msg_pred, sr_model_force_pred)
+    sr_model = SRModel(sr_msg_models, sr_force_models)
     return sr_model
 
-
-def sr_forward(pos, sr_model_msg_pred, sr_model_force_pred):
 
 
 id_dataloader = load_id_dataset()
@@ -126,7 +170,7 @@ sr_model = load_sr()
 
 for pos, edge_index_list, force_gt in id_dataloader:
     force_pred_gnn = gnn_model(pos, edge_index_list)
-    force_pred_sr = sr_model(pos, edge_index_list)
+    force_pred_sr = sr_model.predict(pos, edge_index_list)
     evaluate(force_pred_gnn, force_gt)
     evaluate(force_pred_sr, force_gt)
     break
