@@ -1,5 +1,7 @@
 # gamd_sr
 The objective is test the validity of [Miles hypothesis](https://arxiv.org/abs/2006.11287) over the intramolecular weak-force regime. Partial demonstration of the hypothesis by the author is [here](https://colab.research.google.com/github/MilesCranmer/symbolic_deep_learning/blob/master/GN_Demo_Colab.ipynb).
+### What is Miles hypothesis?
+If we add physics-informed inductive bias in the neural network based surrogate model of physical laws, then the intermidiate computations in NNs gets aligned to the underlying physical principles over which SR can be used to extract symbolic representation. The extracted or distilled symbolic representation _may_ generalize better than the NN itself (from which it was extracted).
 
 ## Motivation
 If the hypothesis works, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
@@ -15,7 +17,13 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 
 ### Notes on the methodology
 1. For systems (or test-cases) where pair-potential functions are well known, we can aim for best fit in SRs (A and B) alone, but still going for extracting the _known_ laws via SR makes sense becuase known forms are well-tested over the years. In that process, we learn to steer SR to the priors (if exist) on the functional forms, refer [this](https://github.com/MilesCranmer/PySR/issues/285).
-
+2. Reported methods (in Miles paper) to introduce inductive bias in GNN-based surrogate models for physical laws are:
+   1. l1 regularization over edge messages
+   2. Constrain edge message dimensions to match that of the problem.
+3. Additional ones experimented with here:
+   1. Penalize standard deviation of all components but the first-3 (for 3D space) edge-message components.
+   2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
+      
 ## Related works
 ### Generalization performance of NNs
 1. https://arxiv.org/abs/2009.11848
