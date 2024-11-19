@@ -4,7 +4,7 @@ The objective is test the validity of [Miles hypothesis](https://arxiv.org/abs/2
 If we add physics-informed inductive bias in the neural network based surrogate model of physical laws, then the intermidiate computations in NNs gets aligned to the underlying physical principles over which SR can be used to extract symbolic representation. The extracted or distilled symbolic representation _may_ generalize better than the NN itself (from which it was extracted).
 
 ## Motivation
-If the hypothesis works, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
+If the hypothesis works in our case, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
 
 
 ## Methodology
