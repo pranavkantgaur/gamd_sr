@@ -2,7 +2,8 @@
 The objective is test the validity of [Miles hypothesis](https://arxiv.org/abs/2006.11287) over the intramolecular weak-force regime. Partial demonstration of the hypothesis by the author is [here](https://colab.research.google.com/github/MilesCranmer/symbolic_deep_learning/blob/master/GN_Demo_Colab.ipynb).
 
 ## Motivation
-If the hypothesis works, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations.
+If the hypothesis works, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
+
 
 ## Methodology
 For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-generation) studied in the [reference paper](https://arxiv.org/abs/2112.03383) with [official implementation](https://github.com/BaratiLab/GAMD), apply Miles hypothesis for symbolic distillation of GNN:
@@ -12,11 +13,19 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 4. Regress analytic equation to predict net force as a function of aggregate edge messages (B) : https://github.com/pranavkantgaur/gamd_sr/blob/main/sr_over_gnn.py (refer `regress_net_force_equation`)
 5. Compare generalization performance of resulting analytic equation (Input -> A -> B -> net force) vs the GNN over a test dataset.: https://github.com/pranavkantgaur/gamd_sr/blob/main/test_sr_generalization.py (**in progress**)
 
+### Notes on the methodology
+1. For systems (or test-cases) where pair-potential functions are well known, we can aim for best fit in SRs (A and B) alone, but still going for extracting the _known_ laws via SR makes sense becuase known forms are well-tested over the years. In that process, we learn to steer SR to the priors (if exist) on the functional forms, refer [this](https://github.com/MilesCranmer/PySR/issues/285).
 
 ## Related works
+### Generalization performance of NNs
+1. https://arxiv.org/abs/2009.11848
+2. https://arxiv.org/pdf/1905.13211
+
+### SR approaches:
+There are many approaches for SR nowdays, above is more of a hand-engineering approach, below are the recent end-to-end ones:
 1. https://github.com/facebookresearch/symbolicregression
 2. https://github.com/deep-symbolic-mathematics/LLM-SR
 3. https://github.com/facebookresearch/recur
 4. https://github.com/vastlik/symformer
 5. https://github.com/omron-sinicx/transformer4sr
-6. https://thegradient.pub/neural-algorithmic-reasoning/
+6. https://thegradient.pub/neural-algorithmic-reasoning/ (NAR looks eerily similar to SR)
