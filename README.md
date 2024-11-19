@@ -3,6 +3,7 @@ The objective is test the validity of [Miles hypothesis](https://arxiv.org/abs/2
 
 ## Motivation
 If the hypothesis works, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations.
+
 ## Methodology
 For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-generation) studied in the [reference paper](https://arxiv.org/abs/2112.03383) with [official implementation](https://github.com/BaratiLab/GAMD), apply Miles hypothesis for symbolic distillation of GNN:
 1. Fit GNN over data to predict net force on particles given input positions : https://github.com/pranavkantgaur/gamd_sr/blob/main/reference_gamd_train.py
@@ -10,3 +11,12 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 3. Regress analytic equation to predict edge messages as a function of particle-pair position and radial distance (A) : https://github.com/pranavkantgaur/gamd_sr/blob/main/sr_over_gnn.py (refer `regress_edge_message_equation`)
 4. Regress analytic equation to predict net force as a function of aggregate edge messages (B) : https://github.com/pranavkantgaur/gamd_sr/blob/main/sr_over_gnn.py (refer `regress_net_force_equation`)
 5. Compare generalization performance of resulting analytic equation (Input -> A -> B -> net force) vs the GNN over a test dataset.: https://github.com/pranavkantgaur/gamd_sr/blob/main/test_sr_generalization.py (**in progress**)
+
+
+## Related works
+1. https://github.com/facebookresearch/symbolicregression
+2. https://github.com/deep-symbolic-mathematics/LLM-SR
+3. https://github.com/facebookresearch/recur
+4. https://github.com/vastlik/symformer
+5. https://github.com/omron-sinicx/transformer4sr
+6. https://thegradient.pub/neural-algorithmic-reasoning/
