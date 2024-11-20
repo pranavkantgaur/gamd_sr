@@ -21,9 +21,11 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 2. Reported methods (in Miles paper) to introduce inductive bias in GNN-based surrogate models for physical laws are:
    1. l1 regularization over edge messages
    2. Constrain edge message dimensions to match that of the problem.
+   3. Minimise KL divergence between edge messages and Gaussian distribution.
 3. Additional ones experimented with here:
    1. Penalize standard deviation of all components but the first-3 (for 3D space) edge-message components.
    2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
+4. Explicitly checking for correlation between edge messages and physical law (say lennard Jones pair potential) mathematically ensures that SR can infact be applied.
       
 ## Related works
 ### Generalization performance of NNs
