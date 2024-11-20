@@ -26,6 +26,16 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
    1. Penalize standard deviation of all components but the first-3 (for 3D space) edge-message components.
    2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
 4. Explicitly checking for correlation between edge messages and physical law (say lennard Jones pair potential) mathematically ensures that SR can infact be applied.
+
+## Results (in progress)
+1. Dataset: Lennard Jones system with non bonded argon atoms 
+2. GNN MAE over validation data: 
+3. Linearity fit score between edge messages and LJ potential (e1,e2, e3) as a function of dx, dy, dz and r: 
+5. Linearity for score between edge message components (e1, e2, e3) and LJ force a function of dx, dy, dz and r: 
+6. SR MAE for predicting edge message components as a function of dx, dy, dz, r: 
+7. SR MAE for predicting net force components f1, f2, f3 as functions of aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z: 
+8. End to end SR MAE vs GNN over interpolation test data: 
+9. End to end SR MAE vs GNN over extrapolation test data: 
       
 ## Related works
 ### Generalization performance of NNs
