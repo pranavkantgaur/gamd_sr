@@ -7,6 +7,12 @@ If we add physics-informed inductive bias in the neural network based surrogate 
 ## Motivation
 If the hypothesis works in our case, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
 
+### What an end-to-end SR looks like in our case?
+1. End to End SR is tasked to map a N * 3 dimensional input to N * 3 dimensional output, where N is number of atoms in a system -> Intractable.
+2. The approach of symbolic distillation of GNN as proposed by Miles, breaks down SR task to two cascaded SRs: (Tractable)
+   1. SR-1 generates 3 equations each of which maps `dx`, `dy`, `dz`, `r` to `e1`, `e2`, `e3` (4D input to 1D output)
+   2. SR-2 generates 3 equations each of which maps `posX`, `posY`, `posZ`, `agg-1`, `agg-2`, `agg-3` to `f1`, `f2`, `f3` (6D input to 1D output)
+
 
 ## Methodology
 For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-generation) studied in the [reference paper](https://arxiv.org/abs/2112.03383) with [official implementation](https://github.com/BaratiLab/GAMD), apply Miles hypothesis for symbolic distillation of GNN:
