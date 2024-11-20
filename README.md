@@ -25,8 +25,10 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 3. Additional ones experimented with here:
    1. Penalize standard deviation of all components but the first-3 (for 3D space) edge-message components.
    2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
-4. Explicitly checking for correlation between edge messages and physical law (say lennard Jones pair potential) mathematically ensures that SR can infact be applied.
-
+4. Feasibility of doing symbolic regression over intermediate representations of GNN:
+   1. SR for message components: If LJ potential is a function of `dx`, `dy`, `dz`, `r`, and edge message components `e1`, `e2`, `e3` (with highest standard deviation) can be expressed as linear combinations of the components of LJ potential, then `e1`, `e2`, `e3` are functions of `dx`, `dy`, `dz`, `r` as well -> SR could be done.
+   2. SR for net force components: ??
+   
 ## Results (in progress)
 1. Dataset: Lennard Jones system with non bonded argon atoms 
 2. GNN MAE over validation data: 
