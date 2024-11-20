@@ -31,13 +31,14 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
    
 ## Results (in progress)
 1. Dataset: Lennard Jones system with non bonded argon atoms 
-2. GNN MAE over validation data: 
-3. Linearity fit score between edge messages and LJ potential (e1,e2, e3) as a function of dx, dy, dz and r: 
-5. Linearity for score between edge message components (e1, e2, e3) and LJ force a function of dx, dy, dz and r: 
-6. SR MAE for predicting edge message components as a function of dx, dy, dz, r: 
-7. SR MAE for predicting net force components f1, f2, f3 as functions of aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z: 
-8. End to end SR MAE vs GNN over interpolation test data: 
-9. End to end SR MAE vs GNN over extrapolation test data: 
+   1. GNN MAE over validation data: 
+   2. Linearity fit score between edge messages and LJ potential (e1,e2, e3) as a function of dx, dy, dz and r: 
+   3. Linearity for score between edge message components (e1, e2, e3) and LJ force a function of dx, dy, dz and r: 
+   4. SR MAE for predicting edge message components as a function of dx, dy, dz, r: 
+   5. SR MAE for predicting net force components f1, f2, f3 as functions of aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z: 
+   6. End to end SR MAE vs GNN over interpolation test data: 
+   7. End to end SR MAE vs GNN over extrapolation test data:
+2. Continue with other datasets if the hypothesis shows promise over LJ system test-case.
       
 ## Related works
 ### Generalization performance of NNs
