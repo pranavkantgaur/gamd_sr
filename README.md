@@ -52,6 +52,7 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 ## Related works
 ### Generalization of NNs: 
 1. https://arxiv.org/pdf/1905.13211 ([official](https://github.com/NNReasoning/What-Can-Neural-Networks-Reason-About) and [community](https://github.com/KushajveerSingh/deep_learning/tree/main/graph_machine_learning/what_can_neural_networks_reason_about))
+2. https://arxiv.org/abs/1907.03950 ([official](https://github.com/ceyzaguirre4/NSM))
 ### Extrapolation by NNs:
 1. https://arxiv.org/abs/2009.11848 ([official](https://github.com/jinglingli/nn-extrapolate))
 
