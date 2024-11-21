@@ -1,7 +1,7 @@
 # gamd_sr
-The objective is test the validity of [Miles hypothesis](https://arxiv.org/abs/2006.11287) over the intermolecular weak-force regime. Partial demonstration of the hypothesis by the author is [here](https://colab.research.google.com/github/MilesCranmer/symbolic_deep_learning/blob/master/GN_Demo_Colab.ipynb), and an attempt to complete the demo is [here](https://github.com/MilesCranmer/PySR/issues/36).
+The objective is test the validity of [GNN symbolic distillation hypothesis](https://arxiv.org/abs/2006.11287) over the intermolecular weak-force regime. Partial demonstration of the hypothesis by the author is [here](https://colab.research.google.com/github/MilesCranmer/symbolic_deep_learning/blob/master/GN_Demo_Colab.ipynb), and an attempt to complete the demo is [here](https://github.com/MilesCranmer/PySR/issues/36).
 
-### What is Miles hypothesis?
+### What is GNN symbolic distillation hypothesis?
 If we add physics-informed inductive bias in the neural network based surrogate model of physical laws, then the intermidiate computations in NNs gets aligned to the underlying physical principles over which SR can be used to extract symbolic representation. The extracted or distilled symbolic representation _may_ generalize better than the NN itself (from which it was extracted).
 
 ## Motivation
