@@ -50,9 +50,11 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 2. Continue with other datasets if the hypothesis shows promise over LJ system test-case.
       
 ## Related works
-### Generalization performance of NNs
-1. https://arxiv.org/abs/2009.11848
-2. https://arxiv.org/pdf/1905.13211
+### Generalization of NNs: 
+1. https://arxiv.org/pdf/1905.13211 ([official](https://github.com/NNReasoning/What-Can-Neural-Networks-Reason-About) and [community](https://github.com/KushajveerSingh/deep_learning/tree/main/graph_machine_learning/what_can_neural_networks_reason_about))
+### Extrapolation by NNs:
+1. https://arxiv.org/abs/2009.11848 ([official](https://github.com/jinglingli/nn-extrapolate))
+
 
 ### SR approaches:
 There are many approaches for SR nowdays, above is more of a hand-engineering approach, below are the recent end-to-end ones:
