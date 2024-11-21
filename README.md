@@ -31,19 +31,22 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
 3. Additional ones experimented with here:
    1. Penalize standard deviation of all components but the first-3 (for 3D space) edge-message components.
    2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
+   3. Penalize top-3 aggregate edge message components to align with net LJ potential evaluation (**planned**)
+   4. Using PCA map 128-dim edge messages to top-3 message components (**planned**)
 4. Feasibility of doing symbolic regression over intermediate representations of GNN:
-   1. SR for message components: If LJ potential is a function of `dx`, `dy`, `dz`, `r`, and edge message components `e1`, `e2`, `e3` (with highest standard deviation) can be expressed as linear combinations of the components of LJ potential, then `e1`, `e2`, `e3` are functions of `dx`, `dy`, `dz`, `r` as well -> SR could be done.
-   2. SR for net force components: ??
+   1. SR for message components: If LJ pair-potential is a function of `dx`, `dy`, `dz`, `r`, and edge message components `e1`, `e2`, `e3` (with highest standard deviation) can be expressed as linear combinations of the components of LJ potential, then `e1`, `e2`, `e3` are functions of `dx`, `dy`, `dz`, `r` as well -> SR could be done.
+   2. SR for net force components: If net LJ force is a function aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z.
    
 ## Results (in progress)
 1. Dataset: Lennard Jones system with non bonded argon atoms 
    1. GNN MAE over validation data: 
-   2. Linearity fit score between edge messages and LJ potential (e1,e2, e3) as a function of dx, dy, dz and r: 
-   3. Linearity for score between edge message components (e1, e2, e3) and LJ force a function of dx, dy, dz and r: 
+   2. Linearity fit score between edge messages and LJ pair potential (e1,e2, e3) as a function of dx, dy, dz and r: 
+   3. Linearity for score between edge message components (e1, e2, e3) and LJ pair force a function of dx, dy, dz and r: 
    4. SR MAE for predicting edge message components as a function of dx, dy, dz, r: 
-   5. SR MAE for predicting net force components f1, f2, f3 as functions of aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z: 
-   6. End to end SR MAE vs GNN over interpolation test data: 
-   7. End to end SR MAE vs GNN over extrapolation test data:
+   5. Linearity fit score between aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z and net LJ force equation:
+   6. SR MAE for predicting net force components f1, f2, f3 as functions of aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z: 
+   7. End to end SR MAE vs GNN over interpolation test data: 
+   8. End to end SR MAE vs GNN over extrapolation test data:
 2. Continue with other datasets if the hypothesis shows promise over LJ system test-case.
       
 ## Related works
