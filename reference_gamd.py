@@ -597,7 +597,7 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
         self.box_size = self.box_size
 
         self.node_emb = nn.Parameter(torch.randn((1, encoding_size)), requires_grad=True)
-        self.edge_encoder = MLP(3 + 1 + len(self.edge_expand.centers), self.edge_emb_dim, hidden_dim=hidden_dim,
+        self.edge_encoder = MLP(9 + 1 + len(self.edge_expand.centers), self.edge_emb_dim, hidden_dim=hidden_dim,
                                 activation='gelu')
         self.edge_layer_norm = nn.LayerNorm(self.edge_emb_dim)
         self.graph_decoder = MLP(encoding_size, out_feats, hidden_layer=2, hidden_dim=hidden_dim, activation='gelu')
@@ -630,8 +630,18 @@ class SimpleMDNetNew(nn.Module):  # no bond, no learnable node encoder
             self._update_length_stat(self.length_scaler.mean_, np.sqrt(self.length_scaler.var_))
 
         rel_pos_norm = (rel_pos_norm - self.length_mean) / self.length_std
+
+        # Add inductive bias like r^-6, r^-12 to signal intramolecular potentials       
+        r_neg_6_prior = rel_pos.pow(-6)
+        # Replace inf values with 0
+        r_neg_6_prior[torch.isinf(r_neg_6_prior)] = 0.0
+        r_neg_12_prior = rel_pos.pow(-12)
+        r_neg_12_prior[torch.isinf(r_neg_12_prior)] = 0.0
+
         edge_feat = torch.cat((rel_pos_periodic,
-                               rel_pos_norm,
+                               r_neg_6_prior,
+                               r_neg_12_prior,
+                               rel_pos_norm,                               
                                self.edge_expand(rel_pos_norm)), dim=1)
         return edge_feat
 
