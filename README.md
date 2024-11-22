@@ -12,6 +12,7 @@ If the hypothesis works in our case, then we can perhaps discover potential func
 2. The approach of symbolic distillation of GNN as proposed by Miles, breaks down SR task to two cascaded SRs: (Tractable)
    1. SR-1 generates 3 equations each of which maps `dx`, `dy`, `dz`, `r` to `e1`, `e2`, `e3` (4D input to 1D output)
    2. SR-2 generates 3 equations each of which maps `posX`, `posY`, `posZ`, `agg-1`, `agg-2`, `agg-3` to `f1`, `f2`, `f3` (6D input to 1D output)
+3. We can also fit MLPs or interpretable models like decision trees instead of SRs here (aka, _knowledge distillation_ from teacher model (GNN) to student (SRs, MLPs, Decision tree and so on)). 
 
 
 ## Methodology
