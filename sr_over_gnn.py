@@ -50,6 +50,7 @@ from sklearn.preprocessing import StandardScaler
 import matplotlib.tri as mtri
 import pandas as pd
 from pysr import PySRRegressor
+import pickle
 
 # check for CUDA device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -307,7 +308,7 @@ class SmoothConvLayerNew(nn.Module):
         # self.theta_src = nn.Linear(in_node_feats, hidden_dim)
         self.edge_affine = MLP(in_edge_feats, hidden_dim, activation=activation, hidden_layer=2)
         self.src_affine = nn.Linear(in_node_feats, hidden_dim)
-        self.dst_affine = nn.Linear(in_node_feats, hidden_dim)
+        self.dst_affine = nn.Linear(in_node_feats, hidden_dim)        
         self.theta_edge = MLP(hidden_dim, in_node_feats,
                               hidden_dim=hidden_dim, activation=activation, activation_first=True,
                               hidden_layer=2)
@@ -345,13 +346,20 @@ class SmoothConvLayerNew(nn.Module):
             edge_idx = g.edges()
             src_idx = edge_idx[0]
             dst_idx = edge_idx[1]
-            edge_code = self.edge_affine(g.edata['e'])
+            edge_code = self.edge_affine(g.edata['e'])            
             src_code = self.src_affine(h_src[src_idx])
             dst_code = self.dst_affine(h_dst[dst_idx])
             g.edata['e_emb'] = self.theta_edge(edge_code+src_code+dst_code)
             
             self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR           
-
+            
+            edge_msg_stds = torch.std(self.edge_message_neigh_center, dim=0)
+            print("Edge message components with highest stds: ", torch.argsort(edge_msg_stds)[-3:])
+            e1 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-3]]
+            e2 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-2]]
+            e3 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-1]]
+            print("GNN: Edge message 250: ", e1, e2, e3)
+            
             if self.update_edge_emb:
                 normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
             g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
@@ -798,7 +806,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
 
 def plot_param_sparsity(msg_force_dict, param_name):
     msg_array = msg_force_dict[param_name].cpu()
-    msg_importance = msg_array.std(axis=0)        
+    msg_importance = msg_array.std(axis=0)      
     
     top_std_indices = torch.argsort(msg_importance)[-15:]
     top_importance_values = msg_importance[top_std_indices].numpy()
@@ -838,13 +846,19 @@ def linear_transformation_3d_force(alpha):
     lincomb1 = (alpha[0] * expected_forces[:, 0] + alpha[1] * expected_forces[:, 1] + alpha[2] * expected_forces[:, 2]) + alpha[3]
     lincomb2 = (alpha[0+4] * expected_forces[:, 0] + alpha[1+4] * expected_forces[:, 1] + alpha[2+4] * expected_forces[:, 2]) + alpha[3+4]
     lincomb3 = (alpha[0+8] * expected_forces[:, 0] + alpha[1+8] * expected_forces[:, 1] + alpha[2+8] * expected_forces[:, 2]) + alpha[3+8]
-
+    '''
     score = (
         percentile_sum(np.square(msg_most_imp[:, 0] - lincomb1)) +
         percentile_sum(np.square(msg_most_imp[:, 1] - lincomb2)) +
         percentile_sum(np.square(msg_most_imp[:, 2] - lincomb3))
     )/3.0
-
+    '''
+    score = np.mean([np.abs(msg_most_imp[:, 0] - lincomb1) +
+        np.abs(msg_most_imp[:, 1] - lincomb2) +
+        np.abs(msg_most_imp[:, 2] - lincomb3)]) / 3.0
+    
+    print("Alpha now is: ", alpha)
+    print("Score now is: ", score)
     return score
 
 
@@ -868,12 +882,17 @@ def linear_transformation_3d_potential(alpha):
     lincomb2 = (alpha[0+4] * expected_potentials[:, 0] + alpha[1+4] * expected_potentials[:, 1] + alpha[2+4] * expected_potentials[:, 2]) + alpha[3+4]
     lincomb3 = (alpha[0+8] * expected_potentials[:, 0] + alpha[1+8] * expected_potentials[:, 1] + alpha[2+8] * expected_potentials[:, 2]) + alpha[3+8]
 
+    '''
     score = (
         percentile_sum(np.square(msg_most_imp[:, 0] - lincomb1)) +
         percentile_sum(np.square(msg_most_imp[:, 1] - lincomb2)) +
         percentile_sum(np.square(msg_most_imp[:, 2] - lincomb3))
     )/3.0
-
+    '''
+    score = np.mean([np.abs(msg_most_imp[:, 0] - lincomb1) + np.abs(msg_most_imp[:, 1] - lincomb2) + np.abs(msg_most_imp[:, 2] - lincomb3)]) / 3.0
+    
+    print("Alpha now is: ", alpha)
+    print("Score now is: ", score)
     return score
 
 
@@ -886,7 +905,8 @@ def out_linear_transformation_3d_potential(alpha):
     lincomb2 = (alpha[0+4] * expected_potentials[:, 0] + alpha[1+4] * expected_potentials[:, 1] + alpha[2+4] * expected_potentials[:, 2]) + alpha[3+4]
     lincomb3 = (alpha[0+8] * expected_potentials[:, 0] + alpha[1+8] * expected_potentials[:, 1] + alpha[2+8] * expected_potentials[:, 2]) + alpha[3+8]
     
-    return lincomb1, lincomb2, lincomb3
+    print("alphas: ", alpha)
+    return lincomb1, lincomb2,  lincomb3
 
 
 
@@ -920,11 +940,12 @@ def are_edge_msgs_gt_force_correlated(msg_force_dict):
     min_result = minimize(linear_transformation_3d_force, np.ones(dim**2 + dim), method='Powell')
 
     print("Fit score: ", min_result.fun/msg_force_dict['edge_messages'].shape[0])
+    
 
     # Visualize the fit
     for i in range(dim):
         px = out_linear_transformation_3d_force(min_result.x)[i]
-        py = msg_most_imp[:, i]
+        py = msg_most_imp[:, i] 
         plt.scatter(px, py)
         plt.show()
     
@@ -1056,6 +1077,21 @@ def plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict):
 
 
 ################################################## Do, symbolic regression if linearity exists #########################################
+def drop_outliers(data):
+    # Calculate IQR for each column and identify outliers
+    Q1 = data.quantile(0.25)
+    Q3 = data.quantile(0.75)
+    IQR = Q3 - Q1
+
+    # Determine outliers based on IQR
+    outlier_condition = (data < (Q1 - 1.5 * IQR)) | (data > (Q3 + 1.5 * IQR))
+
+    # Remove outliers
+    data = data[~outlier_condition.any(axis=1)]        
+    return data
+
+
+
 def regress_edge_message_equation(msg_force_dict):     
     
     dx = msg_force_dict['dx'].cpu()
@@ -1080,37 +1116,106 @@ def regress_edge_message_equation(msg_force_dict):
         'z2': z2.squeeze(),
         'z3': z3.squeeze(),
     })
+
+
+    print("Data shape before outlier removal: ", data.shape)
+    data = drop_outliers(data)    
+    print("Data shape after outlier removal: ", data.shape)
+    '''
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    # Set up the matplotlib figure
+    plt.figure(figsize=(15, 10))
+    # Calculate IQR for each column and identify outliers
+    Q1 = data.quantile(0.25)
+    Q3 = data.quantile(0.75)
+    IQR = Q3 - Q1
+
+    # Determine outliers based on IQR
+    outlier_condition = (data < (Q1 - 1.5 * IQR)) | (data > (Q3 + 1.5 * IQR))
+
+    # Display outliers
+    outliers = data[outlier_condition.any(axis=1)]
+    print("Outliers based on IQR:")
+    print(outliers)
+
+    # Optional: Visualize the IQR ranges
+    plt.figure(figsize=(10, 6))
+    for col in data.columns:
+        plt.subplot(3, 3, list(data.columns).index(col) + 1)
+        sns.boxplot(data[col])
+        plt.title(f'IQR Visualization: {col}')
+
+    plt.tight_layout()
+    plt.show()
+
+    exit(0)
+    '''
+
+
     
     # Define the features and target variable
     X = data[['dx', 'dy', 'dz', 'r']].values
+    #X = data[['r']].values
     
     for comp_id in range(3):
         y = data[f"z{comp_id + 1}"].values
         print(f"Fitting edge message comp-{comp_id + 1} now....")
+        '''
         model = PySRRegressor(
         niterations=1000,
         model_selection="accuracy",
-        binary_operators=["-", "*", "/", "pow", "+"],        
+        binary_operators=["-", "/", "pow"],        
         unary_operators=[
             "inv(x) = 1/x",
             # ^ Custom operator (julia syntax)
         ],      
         extra_sympy_mappings={"inv": lambda x: 1 / x},
         # ^ Define operator for SymPy as well
-        elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+        elementwise_loss="loss(prediction, target) = abs(prediction - target)",
         # ^ Custom loss function (julia syntax)  
         complexity_of_variables=2,
-        constraints={"pow": (-1, 1)},  
+        constraints={"pow": (-1, 1)}, 
+        batching=True, 
         )
-    
-        # Fit the model to the data
-        model.fit(X, y)
+        '''
+        model = PySRRegressor(
+        niterations=1000,  # < Increase me for better results
+        model_selection="accuracy",
+        binary_operators=["+", "*"],
+        unary_operators=[
+            "cos",
+            "exp",
+            "sin",
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = abs(prediction - target)",
+        # ^ Custom loss function (julia syntax)
+        batching=True, 
+        )
         
+        # Fit the model to the data
+        model.fit(X, y, variable_names = ['dx', 'dy', 'dz', 'r'])
+        #model.fit(X, y, variable_names = ['r'])
+        model_filename = f"pysr_model_msg_{comp_id}_pred.pkl"
+
+        # Save the model to a file
+        with open(model_filename, 'wb') as file:
+            pickle.dump(model, file)
+
         # Get the best equation found by PySR
         best_equation = model.get_best()
         
         print(f"Best equation for edge message comp-{comp_id + 1} as a function of dx, dy, dz, and r:")
-        print(best_equation)
+        print(best_equation)        
+        from matplotlib import pyplot as plt
+        plt.scatter(y, model.predict(X))
+        plt.xlabel('Truth')
+        plt.ylabel('Prediction')
+        plt.show()        
 
 def regress_net_force_equation(msg_force_dict):
     x = msg_force_dict['pos'][:, 0].cpu()
@@ -1142,31 +1247,61 @@ def regress_net_force_equation(msg_force_dict):
         'force_gt_comp_3': force_gt[:, 2].squeeze(),
     })
     
+    print("Data shape before outlier removal: ", data.shape)
+    data = drop_outliers(data)    
+    print("Data shape after outlier removal: ", data.shape)
+
     # Define the features and target variable
     X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
     
     for comp_id in range(3):
         y = data[f"force_gt_comp_{comp_id + 1}"].values
         print(f"Fitting force_gt comp-{comp_id + 1} now....")
+        '''
         model = PySRRegressor(
-            niterations=1000,  # < Increase me for better results
+            niterations=10000,  # < Increase me for better results
             model_selection="accuracy",
-            binary_operators=["+", "*", "-", "/", "^"],
+            binary_operators=["-", "/", "^"],
             unary_operators=[
-                "cos",
-                "exp",
-                "sin",
                 "inv(x) = 1/x",
                 # ^ Custom operator (julia syntax)
             ],
             extra_sympy_mappings={"inv": lambda x: 1 / x},
             # ^ Define operator for SymPy as well
-            elementwise_loss="loss(prediction, target) = (prediction - target)^2",
+            elementwise_loss="loss(prediction, target) = abs(prediction - target)",
             # ^ Custom loss function (julia syntax)
-        )    
+          complexity_of_variables=2,
+        constraints={"pow": (-1, 1)}, 
+        batching=True, 
+        )  
+        '''
+        model = PySRRegressor(
+        niterations=10000,  # < Increase me for better results
+        model_selection="accuracy",
+        binary_operators=["+", "*"],
+        unary_operators=[
+            "cos",
+            "exp",
+            "sin",
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = abs(prediction - target)",
+        # ^ Custom loss function (julia syntax)
+        batching=True, 
+        )
+
         # Fit the model to the data
         model.fit(X, y)
         
+        model_filename = f"pysr_model_netforce_{comp_id}_pred.pkl"
+
+        # Save the model to a file
+        with open(model_filename, 'wb') as file:
+            pickle.dump(model, file)
+      
         # Get the best equation found by PySR
         best_equation = model.get_best()
         
@@ -1176,121 +1311,38 @@ def regress_net_force_equation(msg_force_dict):
 
     return
 
+if __name__ == '__main__':
+    gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 
+    #gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
+    #gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
+    #gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
+    #gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message_node_embed.ckpt'
+    #gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_0.1_reg_message_node_embed.ckpt'
+    #gamdnet_official_model_checkpoint_filename = 'epoch=39-step=360000_bottleneck.ckpt'
+    gamdnet_official_model_checkpoint_filename = 'epoch=39-step=360000_edge_msg_constrained_std.ckpt'
+    md_filedir = '../top/'
+    gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
+    msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
 
-def regress_node_embedding_equation(msg_force_dict):    
-    x = msg_force_dict['pos'][:, 0].cpu()
-    y = msg_force_dict['pos'][:, 1].cpu()
-    z = msg_force_dict['pos'][:, 2].cpu()    
+    '''
+    print("Visualizing sparsity of message components...")
+    plot_param_sparsity(msg_force_dict, "edge_messages")
     
-    aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']    
-    agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
-    agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
-    agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
+    print("Checking the fit between pair force and edge messages now....")
+    are_edge_msgs_gt_force_correlated(msg_force_dict)
     
-    agg_comp_1 = agg_msg_most_imp[:, -1].cpu() # the one with highest std
-    agg_comp_2 = agg_msg_most_imp[:, -2].cpu()
-    agg_comp_3 = agg_msg_most_imp[:, -3].cpu()
-
-    node_embeddings = msg_force_dict['node_embeddings']    
-    node_embeddings_comp_std = torch.std(node_embeddings, axis = 0)
-    k = 3 # tune it to the number of most imp. components in node embeddings.
-    node_embeddings_comp_most_imp_indices = torch.argsort(node_embeddings_comp_std)[-k:] # in ascending order
-    node_embeddings_comp_most_imp = node_embeddings[:, node_embeddings_comp_most_imp_indices]
-
-
-    node_emb_comp_1 = node_embeddings_comp_most_imp[:, -1].cpu() # the one with highest std
-    node_emb_comp_2 = node_embeddings_comp_most_imp[:, -2].cpu()
-    node_emb_comp_3 = node_embeddings_comp_most_imp[:, -3].cpu()
-
-    # Create a DataFrame for easier handling of data
-    data = pd.DataFrame({
-        'x': x.squeeze(),
-        'y': y.squeeze(),
-        'z': z.squeeze(),        
-        'agg_comp_1': agg_comp_1.squeeze(),
-        'agg_comp_2': agg_comp_2.squeeze(),
-        'agg_comp_3': agg_comp_3.squeeze(),
-        'node_embed_comp_1': node_emb_comp_1.squeeze(),
-        'node_embed_comp_2': node_emb_comp_2.squeeze(),
-        'node_embed_comp_3': node_emb_comp_3.squeeze(),
-    })
+    print("Checking the fit between pair potentials and edge messages now....")
+    are_edge_msgs_gt_potential_correlated(msg_force_dict)
+    '''
+    # REGRESS EQ-1
+    print("Finding equations for top-3 message components...")
+    regress_edge_message_equation(msg_force_dict)
+    '''
+    #plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
+    #plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
+    '''
+    # REGRESS EQ-2
+    print("Finding equations for net force components...")
+    regress_net_force_equation(msg_force_dict)
     
-    # Define the features and target variable
-    X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
-    
-    for comp_id in range(k):
-        y = data[f"node_embed_comp_{comp_id + 1}"].values
-        print(f"Fitting node embedding comp-{comp_id + 1} now....")
-        model = PySRRegressor(
-            niterations=1000,  # < Increase me for better results
-            model_selection="accuracy",
-            binary_operators=["+", "*", "-", "/", "^"],
-            unary_operators=[
-                "cos",
-                "exp",
-                "sin",
-                "inv(x) = 1/x",
-                # ^ Custom operator (julia syntax)
-            ],
-            extra_sympy_mappings={"inv": lambda x: 1 / x},
-            # ^ Define operator for SymPy as well
-            elementwise_loss="loss(prediction, target) = (prediction - target)^2",
-            # ^ Custom loss function (julia syntax)
-        )    
-        # Fit the model to the data
-        model.fit(X, y)
-        
-        # Get the best equation found by PySR
-        best_equation = model.get_best()
-        
-        print(f"Best equation for node embedding comp-{comp_id + 1} as a function of x, y, z, and aggreggate edge messages is: ")
-        print(best_equation)
-
-
-
-    return
-
-
-gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
-#gamdnet_official_model_checkpoint_filename = 'checkpoint.ckpt'
-#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_standard.ckpt'
-#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message.ckpt'
-#gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_message_node_embed.ckpt'
-gamdnet_official_model_checkpoint_filename = 'epoch=29-step=270000_l1_0.1_reg_message_node_embed.ckpt'
-md_filedir = '../top/'
-gamdnet, gamdnet_official, dataloader = load_model_and_dataset(gamd_model_weights_filename, gamdnet_official_model_checkpoint_filename, md_filedir)
-msg_force_dict = get_msg_force_dict(gamdnet, gamdnet_official, dataloader)
-
-'''
-print("Visualizing sparsity of message components...")
-plot_param_sparsity(msg_force_dict, "edge_messages")
-
-print("Checking potentials now....")
-are_edge_msgs_gt_potential_correlated(msg_force_dict)
-'''
-# REGRESS EQ-1
-#print("Finding equations for top-3 message components...")
-#regress_edge_message_equation(msg_force_dict)
-
-#plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
-#plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
-'''
-print("Visualizing sparsity of node embedding components...")
-plot_param_sparsity(msg_force_dict, "node_embeddings")
-'''
-
-# REGRESS EQ-2
-#print("Finding equations for top-3 node embedding components...")
-#regress_node_embedding_equation(msg_force_dict)
-
-print("Finding equations for net force components...")
-regress_net_force_equation(msg_force_dict)
-
-'''
-# Run inference purely using SR
-for pos, edge_index_list, force_gt in dataloader:
-    force_pred = predict_force_with_sr(pos, edge_index_list)
-    evaluate(force_gt.cpu(), force_pred.cpu())
-    break
-'''
