@@ -353,22 +353,24 @@ class SmoothConvLayerNew(nn.Module):
             
             self.edge_message_neigh_center = src_code * g.edata['e_emb'] # for storing edge messages, SR           
             
-            edge_msg_stds = torch.std(self.edge_message_neigh_center, dim=0)
+            '''
+            edge_msg_stds = torch.std(self.edge_message_neigh_center, dim=0)            
             print("Edge message components with highest stds: ", torch.argsort(edge_msg_stds)[-3:])
             e1 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-3]]
             e2 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-2]]
             e3 = self.edge_message_neigh_center[:50, torch.argsort(edge_msg_stds)[-1]]
             print("GNN: Edge message 250: ", e1, e2, e3)
-            
+            '''
             if self.update_edge_emb:
                 normalized_e_emb = self.edge_layer_norm(g.edata['e_emb'])
             g.update_all(fn.u_mul_e('h', 'e_emb', 'm'), fn.sum('m', 'h'))
             edge_emb = g.ndata['h']
-            self.aggregate_edge_messages = edge_emb # Add aggregate edge message recording, SR. Can be used for verifying the predicted aggregated edge messages based on SR for edge message function.
-            self.input_node_embeddings = h
+            self.aggregate_edge_messages = edge_emb # Add aggregate edge message recording, SR. 
+            self.input_node_embeddings = h # For SR
         if self.update_edge_emb:
             g.edata['e'] = normalized_e_emb
         node_feat = self.phi(self.phi_dst(h) + self.phi_edge(edge_emb)) # So, we need to predict edge_emb (aggrgated edge messages), h (input node embeddings) inputs for the last message passing layer using SR to effecitively couple SR with the remaining GNN.  
+        self.node_embeddings = node_feat # For SR
         return node_feat
 
 
@@ -761,6 +763,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
                                [edge_index_list])
             msg_force_dict['edge_messages'] = gamdnet_official.graph_conv.conv[-1].edge_message_neigh_center 
             msg_force_dict['aggregate_edge_messages'] = gamdnet_official.graph_conv.conv[-1].aggregate_edge_messages
+            
             print("Results from official model:")
             evaluate(force_gt, force_pred_official)
             
@@ -796,7 +799,7 @@ def get_msg_force_dict(gamdnet, gamdnet_official, dataloader):
             msg_force_dict['potential_gt'] = lj_potential[valid_indices][non_zero_rows_mask]
             msg_force_dict['net_force_gt'] = force_gt
             msg_force_dict['pos'] = pos
-            msg_force_dict['node_embeddings'] = gamdnet_official.graph_conv.conv[-1].input_node_embeddings
+            msg_force_dict['node_embeddings'] = gamdnet_official.graph_conv.conv[-1].node_embeddings
             
 
         break # run dataloader only once
@@ -1118,9 +1121,9 @@ def regress_edge_message_equation(msg_force_dict):
     })
 
 
-    print("Data shape before outlier removal: ", data.shape)
-    data = drop_outliers(data)    
-    print("Data shape after outlier removal: ", data.shape)
+    #print("Data shape before outlier removal: ", data.shape)
+    #data = drop_outliers(data)    
+    #print("Data shape after outlier removal: ", data.shape)
     '''
     import seaborn as sns
     import matplotlib.pyplot as plt
@@ -1217,6 +1220,7 @@ def regress_edge_message_equation(msg_force_dict):
         plt.ylabel('Prediction')
         plt.show()        
 
+
 def regress_net_force_equation(msg_force_dict):
     x = msg_force_dict['pos'][:, 0].cpu()
     y = msg_force_dict['pos'][:, 1].cpu()
@@ -1247,9 +1251,9 @@ def regress_net_force_equation(msg_force_dict):
         'force_gt_comp_3': force_gt[:, 2].squeeze(),
     })
     
-    print("Data shape before outlier removal: ", data.shape)
-    data = drop_outliers(data)    
-    print("Data shape after outlier removal: ", data.shape)
+    #print("Data shape before outlier removal: ", data.shape)
+    #data = drop_outliers(data)    
+    #print("Data shape after outlier removal: ", data.shape)
 
     # Define the features and target variable
     X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
@@ -1311,6 +1315,250 @@ def regress_net_force_equation(msg_force_dict):
 
     return
 
+
+
+def regress_net_force_equation_node_embeddings(msg_force_dict):
+    
+    
+    node_embeddings_std = torch.std(msg_force_dict['node_embeddings'], axis = 0)
+    node_emb_most_imp_idx = torch.argsort(node_embeddings_std)[-6:] # top-3
+    node_embeddings_most_imp = msg_force_dict['node_embeddings'][:, node_emb_most_imp_idx]
+    
+    x = node_embeddings_most_imp[:, -1].cpu()
+    y = node_embeddings_most_imp[:, -2].cpu()
+    z = node_embeddings_most_imp[:, -3].cpu()    
+    p = node_embeddings_most_imp[:, -4].cpu()
+    q = node_embeddings_most_imp[:, -5].cpu()
+    r = node_embeddings_most_imp[:, -6].cpu()
+    '''
+    aggregate_edge_messages = msg_force_dict['aggregate_edge_messages']    
+    agg_msg_comp_std = torch.std(aggregate_edge_messages, axis = 0)
+    agg_msg_comp_most_imp_indices = torch.argsort(agg_msg_comp_std)[-3:] # in ascending order
+    agg_msg_most_imp = aggregate_edge_messages[:, agg_msg_comp_most_imp_indices]
+    
+    agg_comp_1 = agg_msg_most_imp[:, -1].cpu() # the one with highest std
+    agg_comp_2 = agg_msg_most_imp[:, -2].cpu()
+    agg_comp_3 = agg_msg_most_imp[:, -3].cpu()
+    '''
+    force_gt = msg_force_dict['net_force_gt'].cpu()    
+
+    
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'x': x.squeeze(),
+        'y': y.squeeze(),
+        'z': z.squeeze(),        
+        'p': p.squeeze(),
+        'q': q.squeeze(),
+        'r': r.squeeze(),
+        'force_gt_comp_1': force_gt[:, 0].squeeze(),
+        'force_gt_comp_2': force_gt[:, 1].squeeze(),
+        'force_gt_comp_3': force_gt[:, 2].squeeze(),
+    })
+    
+    #print("Data shape before outlier removal: ", data.shape)
+    #data = drop_outliers(data)    
+    #print("Data shape after outlier removal: ", data.shape)
+
+    # Define the features and target variable
+    #X = data[['x', 'y', 'z', 'agg_comp_1', 'agg_comp_2', 'agg_comp_3']].values
+    X = data[['x', 'y', 'z', 'p', 'q', 'r']].values
+    for comp_id in range(3):
+        y = data[f"force_gt_comp_{comp_id + 1}"].values
+        print(f"Fitting force_gt comp-{comp_id + 1} now....")
+        '''
+        model = PySRRegressor(
+            niterations=10000,  # < Increase me for better results
+            model_selection="accuracy",
+            binary_operators=["-", "/", "^"],
+            unary_operators=[
+                "inv(x) = 1/x",
+                # ^ Custom operator (julia syntax)
+            ],
+            extra_sympy_mappings={"inv": lambda x: 1 / x},
+            # ^ Define operator for SymPy as well
+            elementwise_loss="loss(prediction, target) = abs(prediction - target)",
+            # ^ Custom loss function (julia syntax)
+          complexity_of_variables=2,
+        constraints={"pow": (-1, 1)}, 
+        batching=True, 
+        )  
+        '''
+        model = PySRRegressor(
+        niterations=10000,  # < Increase me for better results
+        model_selection="accuracy",
+        binary_operators=["+", "*"],
+        unary_operators=[
+            "cos",
+            "exp",
+            "sin",
+            "inv(x) = 1/x",
+            # ^ Custom operator (julia syntax)
+        ],
+        extra_sympy_mappings={"inv": lambda x: 1 / x},
+        # ^ Define operator for SymPy as well
+        elementwise_loss="loss(prediction, target) = abs(prediction - target)",
+        # ^ Custom loss function (julia syntax)
+        batching=True, 
+        )
+
+        # Fit the model to the data
+        model.fit(X, y)
+        
+        model_filename = f"pysr_model_netforce_node_embeddings_{comp_id}_pred.pkl"
+
+        # Save the model to a file
+        with open(model_filename, 'wb') as file:
+            pickle.dump(model, file)
+      
+        # Get the best equation found by PySR
+        best_equation = model.get_best()
+        
+        print(f"Best equation for force gt comp-{comp_id + 1} as a function of node embeddings, and aggreggate edge messages is: ")
+        print(best_equation)
+
+
+    return
+
+
+def fit_decision_tree_edge_msg_prediction(msg_force_dict):
+    print("Fitting decision tree for edge messsage prediction...")
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+    from sklearn.tree import DecisionTreeRegressor, plot_tree
+    from sklearn.metrics import mean_absolute_error
+
+    dx = msg_force_dict['dx'].cpu()
+    dy = msg_force_dict['dy'].cpu()
+    dz = msg_force_dict['dz'].cpu()
+    r = msg_force_dict['radial_distance'].cpu()
+    
+    msg_comp_std = torch.std(msg_force_dict['edge_messages'], axis = 0)
+    msg_comp_most_imp_indices = torch.argsort(msg_comp_std)[-3:] # in ascending order
+    msg_most_imp = msg_force_dict['edge_messages'][:, msg_comp_most_imp_indices]
+    z1 = msg_most_imp[:, -1].cpu() # the one with highest std
+    z2 = msg_most_imp[:, -2].cpu()
+    z3 = msg_most_imp[:, -3].cpu()
+
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'dx': dx.squeeze(),
+        'dy': dy.squeeze(),
+        'dz': dz.squeeze(),
+        'r': r.squeeze(),
+        'z1': z1.squeeze(),
+        'z2': z2.squeeze(),
+        'z3': z3.squeeze(),
+    })
+    
+    X = data[['dx', 'dy', 'dz', 'r']].values    
+    Y = data[['z1', 'z2', 'z3']].values
+
+    # Creating the Decision Tree Regressor
+    regressor = DecisionTreeRegressor(random_state=42, max_depth=4, min_samples_split=10, min_samples_leaf=10, 
+    max_leaf_nodes=20, ccp_alpha=0.01)
+
+    # Fitting the model
+    regressor.fit(X , Y)
+
+
+    Y_pred = regressor.predict(X)
+    # Evaluating the model
+    mae = mean_absolute_error(Y , Y_pred)
+    print(f'Mean absolute Error: {mae:.2f}')
+
+    # Plotting Predictions vs Ground Truth
+    plt.figure(figsize=(8,6))
+    plt.scatter(Y, Y_pred, color='blue', label='Predictions', alpha=0.7)
+    plt.plot([Y.min(), Y.max()], [Y.min(), Y.max()], color='red', linestyle='--', label='Perfect Prediction')
+    plt.title('Predictions vs Ground Truth (Regression)')
+    plt.xlabel('Ground Truth')
+    plt.ylabel('Predictions')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+    # Visualize the decision tree
+    plt.figure(figsize=(20, 10))  # Set figure size for better readability
+    plot_tree(regressor, feature_names=['dx', 'dy', 'dz', 'r'], filled=True, rounded=True)
+    plt.title("Decision Tree Regressor Visualization")
+    plt.show()    
+
+
+
+
+def fit_decision_tree_net_force_prediction(msg_force_dict):
+    print("Fitting decision tree for netforce prediction...")
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+    from sklearn.tree import DecisionTreeRegressor, plot_tree
+    from sklearn.metrics import mean_absolute_error
+
+    node_embeddings_std = torch.std(msg_force_dict['node_embeddings'], axis = 0)
+    node_emb_most_imp_idx = torch.argsort(node_embeddings_std)[-6:] # top-3
+    node_embeddings_most_imp = msg_force_dict['node_embeddings'][:, node_emb_most_imp_idx]
+    
+    x = node_embeddings_most_imp[:, -1].cpu()
+    y = node_embeddings_most_imp[:, -2].cpu()
+    z = node_embeddings_most_imp[:, -3].cpu()    
+    p = node_embeddings_most_imp[:, -4].cpu()
+    q = node_embeddings_most_imp[:, -5].cpu()
+    r = node_embeddings_most_imp[:, -6].cpu()
+    force_gt = msg_force_dict['net_force_gt'].cpu()    
+
+    
+    # Create a DataFrame for easier handling of data
+    data = pd.DataFrame({
+        'x': x.squeeze(),
+        'y': y.squeeze(),
+        'z': z.squeeze(),        
+        'p': p.squeeze(),
+        'q': q.squeeze(),
+        'r': r.squeeze(),
+        'force_gt_comp_1': force_gt[:, 0].squeeze(),
+        'force_gt_comp_2': force_gt[:, 1].squeeze(),
+        'force_gt_comp_3': force_gt[:, 2].squeeze(),
+    })
+    
+    X = data[['x', 'y', 'z', 'p', 'q', 'r']].values
+    #X = data[['x', 'y', 'z']].values
+    Y = data[['force_gt_comp_1', 'force_gt_comp_2', 'force_gt_comp_3']].values
+
+    # Creating the Decision Tree Regressor
+    regressor = DecisionTreeRegressor(random_state=42, max_depth=5, min_samples_split=10, min_samples_leaf=10, 
+    max_leaf_nodes=20, ccp_alpha=0.01)
+
+    # Fitting the model
+    regressor.fit(X , Y)
+
+
+    Y_pred = regressor.predict(X)
+    # Evaluating the model
+    mae = mean_absolute_error(Y , Y_pred)
+    print(f'Mean absolute Error: {mae:.2f}')
+
+    # Plotting Predictions vs Ground Truth
+    plt.figure(figsize=(8,6))
+    plt.scatter(Y, Y_pred, color='blue', label='Predictions', alpha=0.7)
+    plt.plot([Y.min(), Y.max()], [Y.min(), Y.max()], color='red', linestyle='--', label='Perfect Prediction')
+    plt.title('Predictions vs Ground Truth (Regression)')
+    plt.xlabel('Ground Truth')
+    plt.ylabel('Predictions')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+    # Visualize the decision tree
+    plt.figure(figsize=(20, 10))  # Set figure size for better readability
+    plot_tree(regressor, feature_names=['x', 'y', 'z','p','q', 'r'], filled=True, rounded=True)
+    plt.title("Decision Tree Regressor Visualization")
+    plt.show()    
+
+
+
+
 if __name__ == '__main__':
     gamd_model_weights_filename = 'best_model_vectorized_message_passing.pt'
 
@@ -1334,15 +1582,26 @@ if __name__ == '__main__':
     
     print("Checking the fit between pair potentials and edge messages now....")
     are_edge_msgs_gt_potential_correlated(msg_force_dict)
-    '''
+    
     # REGRESS EQ-1
     print("Finding equations for top-3 message components...")
     regress_edge_message_equation(msg_force_dict)
-    '''
+    
     #plot_lj_force_vs_rad_dist_with_messages(msg_force_dict)
     #plot_lj_potential_vs_rad_dist_with_messages(msg_force_dict)
-    '''
+    
     # REGRESS EQ-2
     print("Finding equations for net force components...")
     regress_net_force_equation(msg_force_dict)
     
+    # REGRESS EQ-3
+    print("Finding equations for net force components as function of agg. msg, node embeddings...")
+    regress_net_force_equation_node_embeddings(msg_force_dict)
+    
+    '''
+    # Fit decision tree for net force prediction    
+    fit_decision_tree_net_force_prediction(msg_force_dict)
+    
+
+    # Fit decision tree for edge message prediction
+    fit_decision_tree_edge_msg_prediction(msg_force_dict)
