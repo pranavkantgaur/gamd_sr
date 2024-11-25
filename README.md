@@ -66,6 +66,7 @@ There are many approaches for SR nowdays, above is more of a hand-engineering ap
 4. https://github.com/vastlik/symformer
 5. https://github.com/omron-sinicx/transformer4sr
 6. https://thegradient.pub/neural-algorithmic-reasoning/ (NAR looks eerily similar to SR)
+7. https://github.com/google-research/google-research/tree/master/automl_zero#automl-zero (discovering ML algoritms from scratch)
 
 ### Knowledge distillation from GNNs:
 1. https://github.com/lexpk/LogicalDistillationOfGNNs
