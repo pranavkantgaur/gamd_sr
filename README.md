@@ -34,7 +34,7 @@ For the [datasets](https://github.com/BaratiLab/GAMD?tab=readme-ov-file#data-gen
    2. For known laws like `LJ potential` based systems, add factors like `r^-6`, `r^-12` in the edge-features (**planned**)
    3. Penalize top-3 aggregate edge message components to align with net LJ potential evaluation (**planned**)
    4. Using PCA map 128-dim edge messages to top-3 message components (**planned**)
-4. Feasibility of doing symbolic regression over intermediate representations of GNN:
+4. Feasibility of doing symbolic regression over intermediate representations of GNN: [Ensures algorithm alignment with Physical laws for better generalization](https://arxiv.org/pdf/1806.01261)
    1. SR for message components: If LJ pair-potential is a function of `dx`, `dy`, `dz`, `r`, and edge message components `e1`, `e2`, `e3` (with highest standard deviation) can be expressed as linear combinations of the components of LJ potential, then `e1`, `e2`, `e3` are functions of `dx`, `dy`, `dz`, `r` as well -> SR could be done.
    2. SR for net force components: If net LJ force is a function aggregate edge message components 1, aggregate edge message components 2, aggregate edge messages component 3, position x, position y, position z.
    
