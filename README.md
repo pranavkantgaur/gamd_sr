@@ -5,7 +5,7 @@ The objective is test the validity of [GNN symbolic distillation hypothesis](htt
 If we add physics-informed inductive bias in the neural network based surrogate model of physical laws, then the intermidiate computations in NNs gets aligned to the underlying physical principles over which SR can be used to extract symbolic representation. The extracted or distilled symbolic representation _may_ generalize better than the NN itself (from which it was extracted).
 
 ## Motivation
-If the hypothesis works in our case, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT based force-field](https://www.pnas.org/content/113/30/8368.short) calculations. If it does not work, we aim for a data-driven explanation for the same.
+If the hypothesis works in our case, then we can perhaps discover potential functions for systems with only [neural network potentials](https://github.com/torchmd/torchmd-net) or [DFT exchange functionals](https://www.pnas.org/content/113/30/8368.short) calculations as demonstrated [here](https://github.com/google-research/google-research/tree/master/symbolic_functionals). If it does not work, we aim for a data-driven explanation for the same.
 
 ### What an end-to-end SR looks like in our case?
 1. End to End SR is tasked to map a N * 3 dimensional input to N * 3 dimensional output, where N is number of atoms in a system -> Intractable.
