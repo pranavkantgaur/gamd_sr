@@ -11,7 +11,7 @@ import sys
 import os
 from matplotlib import pyplot as plt
 
-
+import openmm as mm
 from openmm import *
 from openmm.app import *
 from openmm.unit import *
@@ -19,6 +19,7 @@ from openmm import unit
 from openmm import app
 
 from openmmtools import integrators
+from openmmtools import testsystems
 
 
 def subrandom_particle_positions(nparticles, box_vectors, method='sobol'):
@@ -118,8 +119,7 @@ for seed in range(10):
     epsilon=0.238 * unit.kilocalories_per_mole  # argon,
     cutoff = 3.0 * sigma
     mass=39.9 * unit.amu
-    charge = 0.0 * unit.elementary_charge        
-
+    charge = 0.0 * unit.elementary_charge       
     # Create an empty system object.
     system = openmm.System()
 
@@ -138,21 +138,58 @@ for seed in range(10):
     # Add the constants for epsilon and sigma as global parameters
     custom_force.addGlobalParameter("epsilon", epsilon)
     custom_force.addGlobalParameter("sigma", sigma)
-    
   
     # Set periodic cutoff for nonbonded interactions    
     custom_force.setNonbondedMethod(CustomNonbondedForce.CutoffPeriodic)
     custom_force.setCutoffDistance(cutoff)
-    #custom_force.setUseDispersionCorrection(True)    
       
       
     for particle_index in range(nparticles):
       system.addParticle(mass)      
       custom_force.addParticle([])
       
-    positions = subrandom_particle_positions(nparticles, system.getDefaultPeriodicBoxVectors())
+    # Add custom bond force to match the original GAMD simulation    
+    fluid = testsystems.LennardJonesFluid(nparticles=nparticles, reduced_density=0.50, shift=False,  dispersion_correction=True)
+    [topology, system, positions] = fluid.topology, fluid.system, fluid.positions  
+
+
+     
+    for force in system.getForces():
+        if isinstance(force, mm.NonbondedForce):
+            original_nonbonded_force = force
+            print("Got nonbonded force.")
+                
+    for index in range(original_nonbonded_force.getNumExceptions()):
+        j, k, chargeprod, sigma, epsilon = original_nonbonded_force.getExceptionParameters(index)
+        custom_force.addExclusion(j, k)
+        print("Got exceptions for non-bonded force field.")
+    
+    ONE_4PI_EPS0 = 138.935456
+    eps_solvent = original_nonbonded_force.getReactionFieldDielectric()
+    krf = (1/ (cutoff**3)) * (eps_solvent - 1) / (2*eps_solvent + 1)
+    crf = (1/ cutoff) * (3* eps_solvent) / (2*eps_solvent + 1)
+
+
+    energy_expression  = "4*epsilon*((sigma/r)^12 - (sigma/r)^6) + ONE_4PI_EPS0*chargeprod*(1/r + krf*r*r - crf);"
+    energy_expression += "krf = {:f};".format(krf.value_in_unit(unit.nanometer**-3))
+    energy_expression += "crf = {:f};".format(crf.value_in_unit(unit.nanometer**-1))
+    energy_expression += "ONE_4PI_EPS0 = {:f};".format(ONE_4PI_EPS0)
+    custom_bond_force = mm.CustomBondForce(energy_expression)
+    custom_bond_force.addPerBondParameter('chargeprod')
+    custom_bond_force.addPerBondParameter('sigma')
+    custom_bond_force.addPerBondParameter('epsilon')
+    
+    for index in range(original_nonbonded_force.getNumExceptions()):
+        j, k, chargeprod, sigma, epsilon = original_nonbonded_force.getExceptionParameters(index)
+        custom_bond_force.addBond(j, k, [chargeprod, sigma, epsilon])
+        print("Added bond to account for exception is nonbonded force field.")
+    
     system.addForce(custom_force)
-        
+    system.addForce(custom_bond_force)
+
+    # Define initial positions
+    positions = subrandom_particle_positions(nparticles, system.getDefaultPeriodicBoxVectors())
+            
     # Create topology.
     topology = app.Topology()
     element = app.Element.getBySymbol('Ar')
@@ -190,16 +227,19 @@ for seed in range(10):
     simulation.minimizeEnergy(tolerance=1*unit.kilojoule/(unit.mole*unit.nanometer))
     simulation.step(1)
 
-    os.makedirs(f'./lj_data/', exist_ok=True)
-    dataReporter_gt = StateDataReporter(f'./log_nvt_lj_{seed}.txt', 50, totalSteps=50000,
+    os.makedirs(f'./lj_data_ours/run_6', exist_ok=True)
+    stepsPerIter = 50
+    totalIter = 1000
+    totalSteps = stepsPerIter * totalIter
+    dataReporter_gt = StateDataReporter(f'./lj_data_ours/run_6/log_nvt_lj_{seed}.txt', stepsPerIter, totalSteps=totalSteps,
         step=True, time=True, speed=True, progress=True, elapsedTime=True, remainingTime=True,
         potentialEnergy=True, kineticEnergy=True, totalEnergy=True, temperature=True,
                                      separator='\t')
     simulation.reporters.append(dataReporter_gt)
 
-    for t in range(1000):
-        if (t+1)%100 == 0:
-            print(f'Finished {(t+1)*50} steps')
+    for t in range(totalIter):
+        #if (t+1)%100 == 0:
+        #    print(f'Finished {(t+1)*stepsPerIter} steps')
         state = simulation.context.getState(getPositions=True,
                                              getVelocities=True,
                                              getForces=True,
@@ -207,9 +247,9 @@ for seed in range(10):
         pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
         vel = state.getVelocities(asNumpy=True).value_in_unit(unit.meter / unit.second)
         force = state.getForces(asNumpy=True).value_in_unit(unit.kilojoules_per_mole/unit.nanometer)
-        np.savez(f'lj_data/data_{seed}_{t}.npz',
+        np.savez(f'./lj_data_ours/run_6/data_{seed}_{t}.npz',
                  pos=pos,
                  vel=vel,
                  forces=force)
-        simulation.step(50)
+        simulation.step(stepsPerIter)
 
