@@ -220,7 +220,13 @@ for seed in range(10):
                                                                       friction,
                                                                       timestep, chain_length, num_mts, num_yoshidasuzuki)
 
-    simulation = Simulation(topology, system, integrator1)
+
+    platform = Platform.getPlatformByName("CUDA")
+    platformProperties = {'Precision': 'mixed', 'DeviceIndex': '0, 1, 2'}
+
+
+    simulation = Simulation(topology, system, integrator1, platform, platformProperties)
+    
     simulation.context.setPositions(positions)
     simulation.context.setVelocitiesToTemperature(temperature)
 
