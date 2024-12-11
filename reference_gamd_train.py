@@ -19,12 +19,13 @@ from nn_module import SimpleMDNetNew
 from train_utils import LJDataNew
 from graph_utils import NeighborSearcher, graph_network_nbr_fn
 import time
-#os.environ["CUDA_VISIBLE_DEVICES"] = "1" # just to test if it works w/o gpu
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" # just to test if it works w/o gpu
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # for water box
 #CUTOFF_RADIUS = 7.5
-CUTOFF_RADIUS = 10.2
+#CUTOFF_RADIUS = 10.2
+CUTOFF_RADIUS = 15.2
 BOX_SIZE = 27.27
 
 NUM_OF_ATOMS = 258
@@ -73,7 +74,7 @@ def build_model(args, ckpt=None):
                   'out_feats': 3,
                   'hidden_dim': args.hidden_dim,
                   'edge_embedding_dim': args.edge_embedding_dim,
-                  'conv_layer': 4,
+                  'conv_layer': args.num_conv_layer,
                   'drop_edge': args.drop_edge,
                   'use_layer_norm': args.use_layer_norm,
                   'box_size': BOX_SIZE,
@@ -187,7 +188,7 @@ class ParticleNetLightning(pl.LightningModule):
         return edge_idx_tsr
 
     def search_for_neighbor(self, pos, nbr_searcher, masking_fn, type_name):
-        pos_jax = jax.device_put(pos, jax.devices("gpu")[1])
+        pos_jax = jax.device_put(pos, jax.devices("gpu")[0])
 
         if not nbr_searcher.has_been_init:
             nbrs = nbr_searcher.init_new_neighbor_lst(pos_jax)
@@ -267,11 +268,9 @@ class ParticleNetLightning(pl.LightningModule):
             mae = nn.L1Loss()(pred, gt)            
             regularization = 1e-1
             m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
-            std_selected = torch.std(m12[:, :3], dim=0) # inductive bias for 3D force-field
-            mean_std_selected = torch.mean(std_selected)
-            std_remaining = torch.std(m12[:, 3:], dim=0)    
-            mean_std_remaining = torch.mean(std_remaining)
-            loss = mae + regularization * torch.pow((mean_std_remaining - mean_std_selected), 2.0)       
+            std_remaining_abs = torch.abs(torch.std(m12[:, 1:], dim=0)) # k = 1, to align edge messages with pair-potential prediction   
+            mean_std_remaining_abs = torch.mean(std_remaining_abs)
+            loss = mae + regularization * mean_std_remaining_abs # inductive bias to push all info to first k message components.       
         else:
             loss = nn.MSELoss()(pred, gt)
 
@@ -295,7 +294,7 @@ class ParticleNetLightning(pl.LightningModule):
     def train_dataloader(self):
         dataset = LJDataNew(dataset_path=os.path.join(self.data_dir, ''),
                                sample_num=1000,
-                               case_prefix='ljdata_',
+                               case_prefix='data_',
                                seed_num=10,
                                mode='train')
 
@@ -309,7 +308,7 @@ class ParticleNetLightning(pl.LightningModule):
     def val_dataloader(self):
         dataset = LJDataNew(dataset_path=os.path.join(self.data_dir, ''),
                                sample_num=1000,
-                               case_prefix='ljdata_',
+                               case_prefix='data_',
                                seed_num=10,
                                mode='test')
 
@@ -408,12 +407,12 @@ def train_model(args):
     cwd = os.getcwd()
     model_check_point_dir = os.path.join(cwd, check_point_dir)
     os.makedirs(model_check_point_dir, exist_ok=True)
-    print("Checkpoints will be saved at: ", model_check_point_dir)
+    #print("Checkpoints will be saved at: ", model_check_point_dir)
     epoch_end_callback = ModelCheckpointAtEpochEnd(filepath=model_check_point_dir, save_step_frequency=1)
     checkpoint_callback = pl.callbacks.ModelCheckpoint()
 
     trainer = Trainer(
-        devices=[1],#num_gpu,  # Use 'devices' instead of 'gpus'
+        devices=[0],#num_gpu,  # Use 'devices' instead of 'gpus'
         accelerator='gpu',  # Specify the accelerator as 'gpu'
         callbacks=[epoch_end_callback, checkpoint_callback],
         min_epochs=min_epoch,
@@ -423,6 +422,10 @@ def train_model(args):
         strategy='ddp',  # Use 'strategy' for distributed training
         default_root_dir='/home/pranav/gamd_sr/official/GAMD-main/code/LJ/model_ckpt'
     )
+    
+    # Get the version number used for this training run
+    version_number = trainer.logger.version
+    print(f"Checkpoints are saved in: {model_check_point_dir}/lightning_logs/version_{version_number}/checkpoints/")
     trainer.fit(model)
 
 
@@ -434,6 +437,7 @@ def main():
     parser.add_argument('--cp_dir', default='model_ckpt')
     parser.add_argument('--state_ckpt_dir', default=None, type=str)
     parser.add_argument('--batch_size', default=1, type=int)
+    parser.add_argument('--num_conv_layer', default=4, type=int)    
     parser.add_argument('--encoding_size', default=256, type=int)
     parser.add_argument('--hidden_dim', default=128, type=int)
     parser.add_argument('--edge_embedding_dim', default=256, type=int)
