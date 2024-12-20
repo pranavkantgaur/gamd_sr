@@ -115,7 +115,9 @@ class ParticleNetLightning(pl.LightningModule):
         self.nbr_cache = {}
         self.rotate_aug = args.rotate_aug
         self.data_dir = args.data_dir
-        self.loss_fn = args.loss
+        self.num_comp_edge_msg = args.num_comp_edge_msg
+        print(f"Testing for {self.num_comp_edge_msg} component edge messages...")
+        self.loss_fn = args.loss        
         assert self.loss_fn in ['mae', 'mse', 'l1_message', 'kl_message', 'l1_message_node_embed', 'constrain_msg_stds']
 
     def load_training_stats(self, scaler_ckpt):
@@ -268,7 +270,7 @@ class ParticleNetLightning(pl.LightningModule):
             mae = nn.L1Loss()(pred, gt)            
             regularization = 1e-1
             m12 = self.pnet_model.graph_conv.conv[-1].edge_message_neigh_center
-            std_remaining_abs = torch.abs(torch.std(m12[:, 1:], dim=0)) # k = 1, to align edge messages with pair-potential prediction   
+            std_remaining_abs = torch.abs(torch.std(m12[:, self.num_comp_edge_msg:], dim=0)) # for example, k = 1, to align edge messages with pair-potential prediction   
             mean_std_remaining_abs = torch.mean(std_remaining_abs)
             loss = mae + regularization * mean_std_remaining_abs # inductive bias to push all info to first k message components.       
         else:
@@ -446,6 +448,7 @@ def main():
     parser.add_argument('--disable_rotate_aug', dest='rotate_aug', default=True, action='store_false')
     parser.add_argument('--data_dir', default='./md_dataset')
     parser.add_argument('--loss', default='mae')
+    parser.add_argument('--num_comp_edge_msg', default=3, type=int)
     parser.add_argument('--num_gpu', default=-1, type=int)
     args = parser.parse_args()
     train_model(args)
